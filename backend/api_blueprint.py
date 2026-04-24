@@ -1017,91 +1017,399 @@ def api_report_location(location_id):
 # ═════════════════════════════════════════════
 
 @mobile_api.route('/chatbot', methods=['POST'])
+@jwt_required()
 def api_chatbot():
     """
-    Keyword-matching chatbot (Phase 2 replaces this with the LLM).
+    AI-powered accessibility assistant for JOAccess (Rima).
 
-    Request JSON: { "message": str (required), "lang": "en" | "ar" }
-    Returns:     { "response": str, "suggestions": [str, ...] }
+    Flow:
+        1. Load the current user's profile from DB for personalisation
+        2. Query the DB for the top 20 most relevant verified locations
+           (filtered by category/feature keywords extracted from the message)
+           including their avg rating and top accessibility features
+        3. Build a rich system prompt with user context + location data
+        4. Call Gemma 4 via OpenRouter
+        5. Parse the JSON response — which may include a list of location IDs
+           the model chose to recommend
+        6. Return { response, suggestions, locations } to the mobile app
+
+    Request JSON:  { "message": str, "lang": "en" | "ar" }
+    Response JSON: {
+        "response":    str,
+        "suggestions": [str, ...],       -- 2-4 follow-up chips
+        "locations":   [                 -- 0-5 recommended locations
+            {
+                "id": int,
+                "name": str,
+                "name_ar": str,
+                "address": str,
+                "address_ar": str,
+                "category": str,
+                "latitude": float,
+                "longitude": float,
+                "avg_rating": float,
+                "review_count": int,
+                "photo_url": str | null,
+                "features": [str, ...]
+            }
+        ]
+    }
     """
+    from models import User, Location, AccessibilityFeature, Review, Photo
+    from sqlalchemy import select, func
+    from sqlalchemy.orm import selectinload
+
     data = request.get_json(silent=True)
     if not data:
         return jsonify({'error': 'Request body required'}), 400
 
-    message = (data.get('message') or '').lower().strip()
-    lang = data.get('lang', 'en')
+    message = (data.get('message') or '').strip()
+    lang    = data.get('lang', 'en')
 
-    responses_en = {
-        'wheelchair': {
-            'response': 'I can help you find wheelchair-accessible locations! We have locations with wheelchair ramps, accessible entrances, and elevators. Would you like me to show you restaurants, malls, or other specific types of locations?',
-            'suggestions': ['Restaurants', 'Shopping Malls', 'Healthcare', 'Parks'],
-        },
-        'parking': {
-            'response': 'Looking for accessible parking? I can show you locations that have designated accessible parking spots. What type of place are you looking for?',
-            'suggestions': ['Supermarkets', 'Shopping Malls', 'Government Buildings', 'Healthcare'],
-        },
-        'restroom': {
-            'response': 'I can help you find locations with accessible restrooms. These locations have properly equipped facilities for people with disabilities. What category interests you?',
-            'suggestions': ['Restaurants & Cafes', 'Shopping Malls', 'Tourist Attractions', 'Parks'],
-        },
-        'visual': {
-            'response': 'For visual impairments, I recommend locations with braille signage and audio assistance. Would you like to see places in any specific category?',
-            'suggestions': ['Government Buildings', 'Healthcare', 'Educational', 'Transportation'],
-        },
-        'restaurant': {
-            'response': 'Great choice! I can show you accessible restaurants and cafes in Jordan. Many have wheelchair access, accessible restrooms, and wide doorways. Would you like to see them on the map?',
-            'suggestions': ['Show on map', 'Filter by area', 'See reviews'],
-        },
-        'help': {
-            'response': "I'm here to help you find accessible locations in Jordan! You can ask me about:\n• Wheelchair accessibility\n• Accessible parking\n• Restrooms\n• Braille signage\n• Audio assistance\n• Or any specific type of location",
-            'suggestions': ['Restaurants', 'Healthcare', 'Shopping', 'Transportation'],
-        },
+    if not message:
+        return jsonify({'error': 'message is required'}), 400
+
+    api_key = current_app.config.get('ASSISTANT_API_KEY', '')
+    if not api_key:
+        return jsonify({'error': 'Chatbot service not configured.'}), 503
+
+    # ── 1. Load current user profile ──────────────────────────────────
+    # get_current_user() reads the JWT sub claim and returns the User row.
+    # We use this to personalise the system prompt.
+    current_user = get_current_user()
+
+    user_context = "Unknown user."
+    if current_user:
+        parts = [f"Name: {current_user.username}"]
+        if current_user.user_type == 'organization' and current_user.org_name:
+            parts.append(f"Organization: {current_user.org_name}")
+        if current_user.disability:
+            parts.append(f"Disability/needs: {current_user.disability}")
+        parts.append(f"Account type: {current_user.user_type}")
+        user_context = " | ".join(parts)
+
+    # ── 2. Query relevant locations from DB ───────────────────────────
+    # We score relevance by checking if the user's message contains any
+    # category names or feature keywords, then return the top 20 verified
+    # locations sorted by average rating descending.
+    #
+    # This is a simple but effective strategy: the model gets real data
+    # from the actual DB, so its recommendations are grounded in truth.
+
+    # Map readable keywords → DB category strings
+    CATEGORY_KEYWORDS = {
+        'restaurant': 'Restaurants & Cafes',
+        'cafe': 'Restaurants & Cafes',
+        'مطعم': 'Restaurants & Cafes',
+        'مقهى': 'Restaurants & Cafes',
+        'mall': 'Shopping Malls',
+        'shopping': 'Shopping Malls',
+        'تسوق': 'Shopping Malls',
+        'مول': 'Shopping Malls',
+        'hospital': 'Healthcare',
+        'clinic': 'Healthcare',
+        'healthcare': 'Healthcare',
+        'مستشفى': 'Healthcare',
+        'صحة': 'Healthcare',
+        'school': 'Educational',
+        'university': 'Educational',
+        'جامعة': 'Educational',
+        'مدرسة': 'Educational',
+        'government': 'Government Buildings',
+        'ministry': 'Government Buildings',
+        'حكومة': 'Government Buildings',
+        'وزارة': 'Government Buildings',
+        'mosque': 'Religious Places',
+        'church': 'Religious Places',
+        'مسجد': 'Religious Places',
+        'كنيسة': 'Religious Places',
+        'park': 'Parks',
+        'حديقة': 'Parks',
+        'hotel': 'Hotels',
+        'فندق': 'Hotels',
+        'bank': 'Banks & ATMs',
+        'بنك': 'Banks & ATMs',
+        'transport': 'Transportation',
+        'bus': 'Transportation',
+        'مواصلات': 'Transportation',
+        'باص': 'Transportation',
+        'sport': 'Sports & Fitness',
+        'gym': 'Sports & Fitness',
+        'رياضة': 'Sports & Fitness',
+        'tourist': 'Tourist Attractions',
+        'سياحة': 'Tourist Attractions',
     }
 
-    responses_ar = {
-        'كرسي': {
-            'response': 'يمكنني مساعدتك في إيجاد أماكن يمكن الوصول إليها بكرسي متحرك! لدينا أماكن مع منحدرات ومداخل ومصاعد. هل تريد أن أريك مطاعم أو مراكز تسوق أو أنواع أخرى من الأماكن؟',
-            'suggestions': ['مطاعم ومقاهي', 'مراكز تسوق', 'رعاية صحية', 'حدائق'],
-        },
-        'موقف': {
-            'response': 'تبحث عن مواقف سيارات مخصصة؟ يمكنني أن أريك أماكن بها مواقف مخصصة لذوي الإعاقة. ما نوع المكان الذي تبحث عنه؟',
-            'suggestions': ['سوبرماركت', 'مراكز تسوق', 'مباني حكومية', 'رعاية صحية'],
-        },
-        'دورة مياه': {
-            'response': 'يمكنني مساعدتك في إيجاد أماكن بها دورات مياه مجهزة. هذه الأماكن لديها مرافق مناسبة لذوي الإعاقة. أي فئة تهمك؟',
-            'suggestions': ['مطاعم ومقاهي', 'مراكز تسوق', 'مناطق سياحية', 'حدائق'],
-        },
-        'بصر': {
-            'response': 'بالنسبة للإعاقات البصرية، أنصح بأماكن بها لافتات بطريقة برايل ومساعدة صوتية. هل تريد رؤية أماكن في فئة معينة؟',
-            'suggestions': ['مباني حكومية', 'رعاية صحية', 'تعليمية', 'مواصلات'],
-        },
-        'مطعم': {
-            'response': 'اختيار رائع! يمكنني أن أريك مطاعم ومقاهي يمكن الوصول إليها في الأردن. كثير منها لديه منحدرات ودورات مياه مجهزة وأبواب واسعة. هل تريد رؤيتها على الخريطة؟',
-            'suggestions': ['عرض على الخريطة', 'تصفية حسب المنطقة', 'مشاهدة التقييمات'],
-        },
-        'مساعدة': {
-            'response': 'أنا هنا لمساعدتك في إيجاد أماكن يمكن الوصول إليها في الأردن! يمكنك أن تسألني عن:\n• إمكانية الوصول بكرسي متحرك\n• مواقف السيارات المخصصة\n• دورات المياه\n• لافتات برايل\n• المساعدة الصوتية\n• أو أي نوع محدد من الأماكن',
-            'suggestions': ['مطاعم', 'رعاية صحية', 'تسوق', 'مواصلات'],
-        },
+    # Map readable keywords → DB feature_type strings
+    FEATURE_KEYWORDS = {
+        'wheelchair': 'wheelchair_ramp',
+        'ramp': 'wheelchair_ramp',
+        'كرسي': 'wheelchair_ramp',
+        'منحدر': 'wheelchair_ramp',
+        'parking': 'accessible_parking',
+        'موقف': 'accessible_parking',
+        'restroom': 'accessible_restroom',
+        'bathroom': 'accessible_restroom',
+        'toilet': 'accessible_restroom',
+        'دورة مياه': 'accessible_restroom',
+        'حمام': 'accessible_restroom',
+        'braille': 'braille_signage',
+        'برايل': 'braille_signage',
+        'elevator': 'elevator',
+        'lift': 'elevator',
+        'مصعد': 'elevator',
+        'audio': 'audio_assistance',
+        'صوتي': 'audio_assistance',
+        'door': 'wide_doorways',
+        'باب': 'wide_doorways',
+        'entrance': 'accessible_entrance',
+        'مدخل': 'accessible_entrance',
+        'sign language': 'sign_language_support',
+        'لغة إشارة': 'sign_language_support',
     }
 
-    responses = responses_ar if lang == 'ar' else responses_en
+    msg_lower = message.lower()
 
-    for key in responses.keys():
-        if key in message:
-            return jsonify(responses[key]), 200
+    # Find which categories the message is asking about
+    matched_categories = list({
+        cat for kw, cat in CATEGORY_KEYWORDS.items()
+        if kw in msg_lower
+    })
 
-    default_response = {
+    # Find which features the message is asking about
+    matched_features = list({
+        feat for kw, feat in FEATURE_KEYWORDS.items()
+        if kw in msg_lower
+    })
+
+    # Build the location query
+    # We always start with verified locations only.
+    # If the user asked about specific categories, filter to those.
+    # If they asked about specific features, only include locations
+    # that have those features marked as available.
+    loc_query = (
+        db.session.query(Location)
+        .options(
+            selectinload(Location.accessibility_features),
+            selectinload(Location.photos),
+            selectinload(Location.reviews),
+        )
+        .filter(Location.is_verified == True)
+    )
+
+    if matched_categories:
+        loc_query = loc_query.filter(Location.category.in_(matched_categories))
+
+    if matched_features:
+        # Inner join to AccessibilityFeature — only locations that have
+        # at least one of the requested features available
+        loc_query = loc_query.join(
+            AccessibilityFeature,
+            (AccessibilityFeature.location_id == Location.id) &
+            (AccessibilityFeature.feature_type.in_(matched_features)) &
+            (AccessibilityFeature.available == True)
+        ).distinct()
+
+    # Pull up to 20 locations; we'll sort by avg rating in Python
+    # (SQLAlchemy aggregate + eager load in same query is messy)
+    candidate_locations = loc_query.limit(40).all()
+
+    # Sort by avg rating descending, take top 20
+    def avg_rating_for(loc):
+        if not loc.reviews:
+            return 0.0
+        return sum(r.rating for r in loc.reviews) / len(loc.reviews)
+
+    candidate_locations.sort(key=avg_rating_for, reverse=True)
+    top_locations = candidate_locations[:20]
+
+    # ── 3. Serialize locations for the prompt ─────────────────────────
+    # We pass a compact summary to the model so it knows what's available.
+    # Each entry has: id, name, category, avg_rating, review_count, features.
+    # The model must reference IDs in its response so we can look them up.
+
+    location_summaries = []
+    location_map = {}  # id → full serialized dict for the response
+
+    for loc in top_locations:
+        avg_r = avg_rating_for(loc)
+        review_count = len(loc.reviews)
+        available_features = [
+            f.feature_type for f in loc.accessibility_features if f.available
+        ]
+        first_photo = loc.photos[0].filename if loc.photos else None
+
+        # Compact string for the prompt
+        summary = (
+            f"[ID:{loc.id}] {loc.name} ({loc.category}) | "
+            f"Rating: {round(avg_r, 1)}/5 ({review_count} reviews) | "
+            f"Address: {loc.address or 'N/A'} | "
+            f"Features: {', '.join(available_features) or 'none listed'}"
+        )
+        location_summaries.append(summary)
+
+        # Full dict for the API response
+        location_map[loc.id] = {
+            'id':           loc.id,
+            'name':         loc.name,
+            'name_ar':      loc.name_ar,
+            'address':      loc.address or '',
+            'address_ar':   loc.address_ar or '',
+            'category':     loc.category,
+            'latitude':     loc.latitude,
+            'longitude':    loc.longitude,
+            'avg_rating':   round(avg_r, 1),
+            'review_count': review_count,
+            'photo_url':    first_photo,
+            'features':     available_features,
+        }
+
+    locations_context = "\n".join(location_summaries) if location_summaries else "No matching locations found in the database."
+
+    # ── 4. Build the system prompt ────────────────────────────────────
+    system_prompt = f"""You are Rima (ريما), a warm and helpful accessibility assistant for JOAccess — a community-driven platform that maps accessible locations across Jordan for people with disabilities and mobility needs.
+
+CURRENT USER PROFILE:
+{user_context}
+Use this to personalise your answers. For example, if the user has a visual impairment, emphasise braille signage and audio assistance features. If they use a wheelchair, prioritise ramp and elevator availability. Address the user by their first name when natural.
+
+AVAILABLE LOCATIONS FROM THE DATABASE (verified, sorted by rating):
+{locations_context}
+
+Each location is shown as: [ID:number] Name (Category) | Rating | Address | Accessibility Features
+These are REAL locations from the JOAccess database. Only recommend locations from this list. If the list is empty or none are suitable, say so honestly.
+
+ABOUT JOACCESS:
+- JOAccess maps accessible places across Jordan for people with disabilities
+- Users can filter by category and accessibility features, add locations, and write reviews
+- Accessibility features tracked: wheelchair_ramp, accessible_parking, accessible_restroom, elevator, braille_signage, audio_assistance, wide_doorways, accessible_entrance, accessible_seating, sign_language_support
+- Categories: Restaurants & Cafes, Shopping Malls, Healthcare, Educational, Government Buildings, Religious Places, Transportation, Tourist Attractions, Parks, Hotels, Banks & ATMs, Sports & Fitness, Entertainment
+
+JORDAN ACCESSIBILITY CONTEXT:
+- Accessibility infrastructure in Jordan is improving but still inconsistent outside Amman
+- Abdali Boulevard, Mecca Mall, City Mall are among the more accessible areas in Amman
+- Public transportation has limited accessibility; taxis are often more practical
+- Major hospitals like Jordan University Hospital and King Hussein Medical Center have better accessibility
+
+LANGUAGE RULES — CRITICAL:
+- Detect the language and dialect from the user's message
+- If the user writes in Jordanian Arabic dialect (عامية أردنية), respond in Jordanian Arabic dialect — NOT formal Modern Standard Arabic
+- If the user writes in formal Arabic (فصحى), respond in formal Arabic
+- If the user writes in English, respond in English
+- NEVER mix languages in a single response
+- Suggestions must match the language of your response
+
+WHAT YOU DO NOT DO:
+- Do not invent location names, addresses, or details not in the provided list
+- Do not discuss topics unrelated to accessibility, disability, or JOAccess
+- Do not give medical advice
+- Do not remember previous conversations — each session starts fresh
+- If asked something off-topic, politely redirect
+
+MANDATORY JSON RESPONSE FORMAT:
+You MUST respond with ONLY a valid JSON object — no markdown, no code fences, no text before or after. The JSON must have exactly these three keys:
+
+{{
+  "response": "Your full answer as a string. Use \\n for line breaks.",
+  "suggestions": ["Short chip 1", "Short chip 2", "Short chip 3"],
+  "recommended_location_ids": [1, 2, 3]
+}}
+
+- "response": Your helpful answer. Mention recommended locations by name naturally in the text.
+- "suggestions": 2-4 SHORT follow-up chips (3-6 words each) in the same language as the response.
+- "recommended_location_ids": Array of location IDs (integers) from the database list above that are most relevant to this message. Include 0-5 IDs. If no locations are relevant, use an empty array [].
+
+RESPOND WITH JSON ONLY. NO OTHER TEXT."""
+
+    # ── 5. Call OpenRouter (Gemma 4) ──────────────────────────────────
+    url = 'https://openrouter.ai/api/v1/chat/completions'
+    payload = {
+        'model': 'google/gemma-4-31b-it',
+        'messages': [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user',   'content': message},
+        ],
+        'temperature': 0.6,
+        'max_tokens':  800,
+    }
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type':  'application/json',
+        'HTTP-Referer':  'https://joaccess-app.com',
+        'X-Title':       'JOAccess Mobile Assistant',
+    }
+
+    # ── Fallback if anything goes wrong ───────────────────────────────
+    fallback = {
         'en': {
-            'response': "I'm here to help you find accessible locations in Jordan. You can ask me about wheelchair accessibility, parking, restrooms, or specific types of locations like restaurants, malls, or healthcare facilities. How can I assist you?",
-            'suggestions': ['Wheelchair access', 'Accessible parking', 'Restaurants', 'Healthcare'],
+            'response':    "Sorry, I'm having trouble connecting right now. Please try again in a moment.",
+            'suggestions': ['Wheelchair access', 'Accessible parking', 'Find restaurants', 'Help'],
+            'locations':   [],
         },
         'ar': {
-            'response': 'أنا هنا لمساعدتك في إيجاد أماكن يمكن الوصول إليها في الأردن. يمكنك أن تسألني عن إمكانية الوصول بكرسي متحرك، مواقف السيارات، دورات المياه، أو أنواع محددة من الأماكن مثل المطاعم أو المراكز الصحية. كيف يمكنني مساعدتك؟',
-            'suggestions': ['كرسي متحرك', 'مواقف مخصصة', 'مطاعم', 'رعاية صحية'],
+            'response':    'عذراً، في مشكلة بالاتصال هلق. جرب مرة ثانية بعد شوي.',
+            'suggestions': ['كرسي متحرك', 'مواقف مخصصة', 'مطاعم', 'مساعدة'],
+            'locations':   [],
         },
     }
-    return jsonify(default_response.get(lang, default_response['en'])), 200
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=35)
+        resp.raise_for_status()
+
+        raw_content = resp.json()['choices'][0]['message']['content'].strip()
+
+        # Strip markdown code fences defensively
+        if raw_content.startswith('```'):
+            raw_content = raw_content.split('```')[1]
+            if raw_content.startswith('json'):
+                raw_content = raw_content[4:]
+            raw_content = raw_content.strip()
+
+        result = json.loads(raw_content)
+
+        # Validate required fields
+        if not isinstance(result.get('response'), str):
+            raise ValueError('Missing response string')
+        if not isinstance(result.get('suggestions'), list):
+            result['suggestions'] = []
+        if not isinstance(result.get('recommended_location_ids'), list):
+            result['recommended_location_ids'] = []
+
+        # Cap and clean suggestions
+        result['suggestions'] = [str(s) for s in result['suggestions'][:4]]
+
+        # ── 6. Resolve recommended IDs → full location objects ────────
+        # The model returns IDs; we look them up in the map we built
+        # earlier so the mobile app gets full location data.
+        recommended_ids = [
+            int(i) for i in result['recommended_location_ids']
+            if str(i).isdigit() or isinstance(i, int)
+        ][:5]  # cap at 5
+
+        resolved_locations = [
+            location_map[lid]
+            for lid in recommended_ids
+            if lid in location_map
+        ]
+
+        return jsonify({
+            'response':    result['response'],
+            'suggestions': result['suggestions'],
+            'locations':   resolved_locations,
+        }), 200
+
+    except requests.exceptions.Timeout:
+        current_app.logger.error('Chatbot: OpenRouter timed out')
+        return jsonify(fallback.get(lang, fallback['en'])), 200
+
+    except (requests.exceptions.RequestException, KeyError, IndexError) as e:
+        current_app.logger.error('Chatbot: OpenRouter request error: %s', e)
+        return jsonify(fallback.get(lang, fallback['en'])), 200
+
+    except (json.JSONDecodeError, ValueError) as e:
+        current_app.logger.error('Chatbot: Could not parse model JSON: %s | raw: %s', e, raw_content[:200])
+        return jsonify(fallback.get(lang, fallback['en'])), 200
 
 
 # ═════════════════════════════════════════════

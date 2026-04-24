@@ -1239,7 +1239,7 @@ def api_chatbot():
         first_photo = loc.photos[0].filename if loc.photos else None
 
         # Compact string for the prompt
-       verified_label = "✓ verified" if loc.is_verified else "⚠ unverified"
+        verified_label = "✓ verified" if loc.is_verified else "⚠ unverified"
         summary = (
             f"[ID:{loc.id}] {loc.name} ({loc.category}) | "
             f"{verified_label} | "

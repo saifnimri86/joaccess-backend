@@ -1,0 +1,55 @@
+# ── Python / Flask ──────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment files
+.env
+.env.local
+*.env
+!.env.example
+
+# SQLite (if used for quick local testing)
+*.db
+*.sqlite
+*.sqlite3
+
+# Flask uploads
+backend/static/uploads/*
+!backend/static/uploads/.gitkeep
+
+# Migrations: commit the `versions/` files but nothing else dynamic
+# (Flask-Migrate is fine to commit wholesale, actually — keep this simple)
+
+# ── Next.js ─────────────────────────────────────────────────
+admin-panel/node_modules/
+admin-panel/.next/
+admin-panel/out/
+admin-panel/build/
+admin-panel/.env.local
+admin-panel/.env.production.local
+
+# ── OS / Editor ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Logs ────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

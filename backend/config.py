@@ -84,6 +84,13 @@ class Config:
 
     # ── AI (Gemma 4 via OpenRouter) ─────────────────────────────────────
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+    ASSISTANT_API_KEY = os.environ.get("ASSISTANT_API_KEY", "")
+
 
     # ── Debug ──────────────────────────────────────────────────────────
     DEBUG = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
+    
+    # ── Supabase Storage ───────────────────────────────────────────────
+    SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+    SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    

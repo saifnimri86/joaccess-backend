@@ -55,6 +55,7 @@ import os
 import json
 import base64
 import uuid
+import requests
 
 mobile_api = Blueprint('mobile_api', __name__)
 
@@ -202,14 +203,57 @@ def _serialize_location(loc, include_reviews=True):
     return result
 
 
+def _upload_to_supabase(img_bytes: bytes, filename: str) -> str | None:
+    """
+    Upload raw image bytes to Supabase Storage and return the public URL.
+    Returns None if the upload fails for any reason.
+
+    How it works:
+        - We call Supabase's REST Storage API directly with an HTTP PUT request.
+        - The path inside the bucket is just the filename (flat structure, no folders).
+        - The service role key bypasses RLS so the server can always write.
+        - On success Supabase returns 200 and the public URL is deterministic:
+          <SUPABASE_URL>/storage/v1/object/public/location-photos/<filename>
+    """
+    supabase_url = current_app.config.get("SUPABASE_URL", "").rstrip("/")
+    service_key  = current_app.config.get("SUPABASE_SERVICE_KEY", "")
+
+    if not supabase_url or not service_key:
+        current_app.logger.error("Supabase Storage not configured — missing env vars.")
+        return None
+
+    bucket      = "location-photos"
+    upload_url  = f"{supabase_url}/storage/v1/object/{bucket}/{filename}"
+
+    headers = {
+        "Authorization": f"Bearer {service_key}",
+        "Content-Type":  "image/jpeg",   # Supabase uses this for storage; still works for PNG
+        "x-upsert":      "true",         # overwrite if the same filename already exists
+    }
+
+    try:
+        resp = requests.put(upload_url, data=img_bytes, headers=headers, timeout=30)
+        if resp.status_code in (200, 201):
+            # Public URL is deterministic — no need to parse the response body
+            public_url = f"{supabase_url}/storage/v1/object/public/{bucket}/{filename}"
+            return public_url
+        else:
+            current_app.logger.error(
+                "Supabase Storage upload failed: %s %s", resp.status_code, resp.text
+            )
+            return None
+    except requests.RequestException as e:
+        current_app.logger.error("Supabase Storage request error: %s", e)
+        return None
+
+
 def _save_base64_photos(photos_raw, location_id):
     """
-    Save base64-encoded photos from a request payload.
+    Decode base64 photos from the request payload and upload them to
+    Supabase Storage. Stores the returned public URL in the Photo row.
 
-    Enforces size and count caps. Accepts either a list of dicts or a
-    JSON string (coming in via multipart/form-data).
-
-    Returns the number of photos successfully saved.
+    Accepts either a list of dicts or a JSON string (multipart sends it
+    as a string field). Each dict must have 'data' (base64) and 'filename'.
     """
     from models import Photo
 
@@ -218,7 +262,6 @@ def _save_base64_photos(photos_raw, location_id):
     if not isinstance(photos_raw, list):
         return 0
 
-    # Enforce a hard cap regardless of what the client sends
     photos_raw = photos_raw[:MAX_PHOTOS_PER_LOCATION]
 
     saved = 0
@@ -231,30 +274,27 @@ def _save_base64_photos(photos_raw, location_id):
         try:
             img_bytes = base64.b64decode(photo_data['data'])
         except (ValueError, TypeError):
-            continue  # bad base64, skip silently
+            continue
 
         if len(img_bytes) > MAX_PHOTO_BYTES:
-            continue  # skip oversized
+            continue
 
-        filename = _generate_unique_filename(photo_data['filename'])
-        upload_folder = current_app.config['UPLOAD_FOLDER']
-        os.makedirs(upload_folder, exist_ok=True)
-        filepath = os.path.join(upload_folder, filename)
+        filename  = _generate_unique_filename(photo_data['filename'])
+        public_url = _upload_to_supabase(img_bytes, filename)
+        if not public_url:
+            continue  # upload failed, skip this photo
 
-        try:
-            with open(filepath, 'wb') as f:
-                f.write(img_bytes)
-        except OSError:
-            continue  # disk error, skip
-
-        db.session.add(Photo(location_id=location_id, filename=filename))
+        db.session.add(Photo(location_id=location_id, filename=public_url))
         saved += 1
 
     return saved
 
 
 def _save_multipart_photos(files_list, location_id):
-    """Save photo files from a multipart/form-data request."""
+    """
+    Read photo files from a multipart/form-data request and upload them
+    to Supabase Storage. Stores the returned public URL in the Photo row.
+    """
     from models import Photo
 
     saved = 0
@@ -264,28 +304,23 @@ def _save_multipart_photos(files_list, location_id):
         if not file or not file.filename:
             continue
 
-        # Size check — seek to end, tell, seek back
+        # Size check — seek to end to measure, then rewind
         file.seek(0, os.SEEK_END)
         size = file.tell()
         file.seek(0)
         if size > MAX_PHOTO_BYTES:
             continue
 
-        filename = _generate_unique_filename(file.filename)
-        upload_folder = current_app.config['UPLOAD_FOLDER']
-        os.makedirs(upload_folder, exist_ok=True)
-        filepath = os.path.join(upload_folder, filename)
-
-        try:
-            file.save(filepath)
-        except OSError:
+        img_bytes  = file.read()
+        filename   = _generate_unique_filename(file.filename)
+        public_url = _upload_to_supabase(img_bytes, filename)
+        if not public_url:
             continue
 
-        db.session.add(Photo(location_id=location_id, filename=filename))
+        db.session.add(Photo(location_id=location_id, filename=public_url))
         saved += 1
 
     return saved
-
 
 # ═════════════════════════════════════════════
 #  HEALTH

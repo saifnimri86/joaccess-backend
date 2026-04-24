@@ -1194,7 +1194,6 @@ def api_chatbot():
             selectinload(Location.photos),
             selectinload(Location.reviews),
         )
-        .filter(Location.is_verified == True)
     )
 
     if matched_categories:
@@ -1240,8 +1239,10 @@ def api_chatbot():
         first_photo = loc.photos[0].filename if loc.photos else None
 
         # Compact string for the prompt
+       verified_label = "✓ verified" if loc.is_verified else "⚠ unverified"
         summary = (
             f"[ID:{loc.id}] {loc.name} ({loc.category}) | "
+            f"{verified_label} | "
             f"Rating: {round(avg_r, 1)}/5 ({review_count} reviews) | "
             f"Address: {loc.address or 'N/A'} | "
             f"Features: {', '.join(available_features) or 'none listed'}"
@@ -1262,6 +1263,7 @@ def api_chatbot():
             'review_count': review_count,
             'photo_url':    first_photo,
             'features':     available_features,
+            'is_verified':  loc.is_verified,
         }
 
     locations_context = "\n".join(location_summaries) if location_summaries else "No matching locations found in the database."

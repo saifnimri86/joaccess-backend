@@ -481,6 +481,120 @@ def api_login():
     }), 200
 
 
+@mobile_api.route('/auth/change-username', methods=['PUT'])
+@jwt_required()
+def api_change_username():
+    """
+    Change the current user's username.
+
+    Request JSON: { "new_username": str }
+    Returns:      { "message": str, "username": str }
+
+    Validates:
+        - new_username is provided and non-empty
+        - new_username is between 3 and 80 characters
+        - new_username only contains letters, numbers, underscores, hyphens
+        - new_username is not already taken by another user
+    """
+    from models import User
+    import re
+
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({'error': 'Request body required'}), 400
+
+    new_username = (data.get('new_username') or '').strip()
+
+    # ── Validation ────────────────────────────────────────────────────
+    if not new_username:
+        return jsonify({'error': 'New username is required'}), 400
+
+    if len(new_username) < 3:
+        return jsonify({'error': 'Username must be at least 3 characters'}), 400
+
+    if len(new_username) > 80:
+        return jsonify({'error': 'Username must be 80 characters or less'}), 400
+
+    if not re.match(r'^[a-zA-Z0-9_\-\.]+$', new_username):
+        return jsonify({'error': 'Username can only contain letters, numbers, underscores, hyphens, and dots'}), 400
+
+    if new_username == user.username:
+        return jsonify({'error': 'New username is the same as your current username'}), 400
+
+    # ── Uniqueness check ──────────────────────────────────────────────
+    existing = db.session.execute(
+        db.select(User).where(User.username == new_username)
+    ).scalar_one_or_none()
+
+    if existing:
+        return jsonify({'error': 'Username is already taken'}), 409
+
+    # ── Apply change ──────────────────────────────────────────────────
+    user.username = new_username
+    db.session.commit()
+
+    return jsonify({
+        'message': 'Username updated successfully',
+        'username': user.username,
+    }), 200
+
+
+@mobile_api.route('/auth/change-password', methods=['PUT'])
+@jwt_required()
+def api_change_password():
+    """
+    Change the current user's password.
+
+    Request JSON: { "current_password": str, "new_password": str }
+    Returns:      { "message": str }
+
+    Validates:
+        - current_password is correct (verified with bcrypt)
+        - new_password is at least 8 characters
+        - new_password contains at least one number
+        - new_password is different from the current password
+    """
+    import re
+
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({'error': 'Request body required'}), 400
+
+    current_password = data.get('current_password') or ''
+    new_password     = data.get('new_password') or ''
+
+    # ── Verify current password ───────────────────────────────────────
+    if not current_password:
+        return jsonify({'error': 'Current password is required'}), 400
+
+    if not bcrypt.check_password_hash(user.password, current_password):
+        return jsonify({'error': 'Current password is incorrect'}), 401
+
+    # ── Validate new password ─────────────────────────────────────────
+    if len(new_password) < 8:
+        return jsonify({'error': 'New password must be at least 8 characters'}), 400
+
+    if not re.search(r'\d', new_password):
+        return jsonify({'error': 'New password must contain at least one number'}), 400
+
+    if current_password == new_password:
+        return jsonify({'error': 'New password must be different from your current password'}), 400
+
+    # ── Apply change ──────────────────────────────────────────────────
+    user.password = bcrypt.generate_password_hash(new_password).decode('utf-8')
+    db.session.commit()
+
+    return jsonify({'message': 'Password updated successfully'}), 200
+
+
 @mobile_api.route('/auth/refresh', methods=['POST'])
 @jwt_required(refresh=True)
 def api_refresh():

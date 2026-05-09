@@ -1,21 +1,3 @@
-"""
-config.py
-=========
-Central configuration for the JOAccess Flask backend.
-
-All environment variables are read here and nowhere else. If you need
-to know what configures the backend, this file is the one source of
-truth.
-
-Load order in app.py:
-    1. `load_dotenv()` reads a `.env` file into os.environ (dev only; in
-       production Render.com injects env vars directly).
-    2. `Config` is attached to the Flask app via `app.config.from_object`.
-
-Add new settings here rather than sprinkling `os.environ.get(...)` calls
-across the codebase.
-"""
-
 from datetime import timedelta
 import os
 
@@ -86,11 +68,17 @@ class Config:
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
     ASSISTANT_API_KEY = os.environ.get("ASSISTANT_API_KEY", "")
 
+    # ── Computer Vision (Hugging Face Space) ───────────────────────────
+    # CV_SERVICE_URL: base URL of the HF Space running the EfficientNet-B0
+    #   inference service. Example: https://saif-joaccess-cv.hf.space
+    # CV_SHARED_SECRET: must match the CV_SHARED_SECRET set in the Space's
+    #   "Settings -> Variables and secrets" tab. Sent in X-CV-Secret header.
+    CV_SERVICE_URL = os.environ.get("CV_SERVICE_URL", "")
+    CV_SHARED_SECRET = os.environ.get("CV_SHARED_SECRET", "")
 
     # ── Debug ──────────────────────────────────────────────────────────
     DEBUG = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
-    
+
     # ── Supabase Storage ───────────────────────────────────────────────
     SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
     SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
-    

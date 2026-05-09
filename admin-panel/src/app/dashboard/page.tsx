@@ -1,283 +1,337 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
-import { getDashboardStats } from "@/lib/api";
-import { StatCard } from "@/components/ui/StatCard";
-import { StatCardSkeleton } from "@/components/ui/Skeleton";
+import { useState, useEffect, useMemo } from "react";
+import dynamic from "next/dynamic";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
-  Users, MapPin, CheckCircle2, Clock,
-  MessageSquare, AlertTriangle, TrendingUp, Star, BarChart3,
-} from "lucide-react";
-import {
-  AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
-  XAxis, YAxis, Tooltip, ResponsiveContainer, Legend,
-} from "recharts";
+  getLocations, verifyLocation, unverifyLocation, deleteLocation,
+  type Location,
+} from "@/lib/api";
+import { localizeCategory } from "@/lib/i18n";
+import { ConfirmModal } from "@/components/ui/ConfirmModal";
+import { PhotoCarouselModal } from "@/components/ui/PhotoCarouselModal";
+import { CVAnalysisModal } from "@/components/ui/CVAnalysisModal";
+import { Pagination } from "@/components/ui/Pagination";
+import { TableSkeleton } from "@/components/ui/Skeleton";
+import { MapPin, CheckCircle2, XCircle, Trash2, Search, Clock, Images, Brain } from "lucide-react";
 import { useLanguage } from "@/contexts/LanguageContext";
 import { useTheme } from "@/contexts/ThemeContext";
+import { toast } from "@/lib/toast";
 
-// Maroon-leaning palette — no more out-of-theme blues/purples
-const CATEGORY_COLORS = [
-  "#800000","#9A1C1C","#B33838","#D97070","#F4E3E3",
-  "#4A0000","#600000","#D4A045","#6B8E4E","#5F4E2B","#8B5A2B","#A0522D",
+// Leaflet must be dynamically imported — it requires `window`
+const LocationsMap = dynamic(
+  () => import("@/components/ui/LocationsMap").then((m) => m.LocationsMap),
+  { ssr: false, loading: () => <div className="skeleton w-full" style={{ height: 380, borderRadius: 12 }} /> }
+);
+
+const CATEGORIES = [
+  "restaurant","government","park","shopping","healthcare",
+  "education","hotels","mosque","library","gym","pharmacy",
 ];
 
-const RADIAN = Math.PI / 180;
-function CustomPieLabel({
-  cx, cy, midAngle, innerRadius, outerRadius, percent,
-}: {
-  cx?: number; cy?: number; midAngle?: number;
-  innerRadius?: number; outerRadius?: number; percent?: number;
-}) {
-  if (cx == null || cy == null || midAngle == null || innerRadius == null || outerRadius == null) return null;
-  if (!percent || percent < 0.05) return null;
-  const radius = innerRadius + (outerRadius - innerRadius) * 0.5;
-  const x = cx + radius * Math.cos(-midAngle * RADIAN);
-  const y = cy + radius * Math.sin(-midAngle * RADIAN);
-  return (
-    <text x={x} y={y} fill="#fff" textAnchor="middle" dominantBaseline="central" fontSize={10} fontWeight={600}>
-      {`${(percent * 100).toFixed(0)}%`}
-    </text>
-  );
-}
+// Stable query key for the full location cache
+const ALL_LOCS_KEY = ["admin-locations-all"] as const;
 
-export default function DashboardPage() {
-  const { t } = useLanguage();
+type CacheShape = { locations: Location[]; total: number; pages: number };
+
+export default function LocationsPage() {
+  const qc = useQueryClient();
+  const { t, lang } = useLanguage();
   const { theme } = useTheme();
-  const pieStroke = theme === "dark" ? "#181212" : "#ffffff";
+  const [page, setPage] = useState(1);
+  const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [category, setCategory] = useState("");
+  const [verified, setVerified] = useState<"" | "true" | "false">("");
+  const [toDelete, setToDelete] = useState<Location | null>(null);
+  const [photoLoc, setPhotoLoc] = useState<Location | null>(null);
+  const [cvLoc, setCvLoc] = useState<Location | null>(null);
 
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["dashboard-stats"],
-    queryFn: getDashboardStats,
+  // Debounce search by 350 ms — table only fires a request after typing stops
+  useEffect(() => {
+    const id = setTimeout(() => setDebouncedSearch(search), 350);
+    return () => clearTimeout(id);
+  }, [search]);
+
+  useEffect(() => { setPage(1); }, [debouncedSearch, category, verified]);
+
+  // Paginated table query — uses debouncedSearch to avoid per-keystroke requests
+  const { data, isLoading } = useQuery({
+    queryKey: ["admin-locations", page, debouncedSearch, category, verified],
+    queryFn: () =>
+      getLocations({
+        page,
+        per_page: 15,
+        search: debouncedSearch || undefined,
+        category: category || undefined,
+        verified: verified === "" ? undefined : verified === "true",
+      }),
+    placeholderData: (prev) => prev,
   });
 
-  const monthlyLocData   = data?.monthly_locations.map(([month, count]) => ({ month, count })) ?? [];
-  const monthlyUsersData = data?.monthly_users.map(([month, count]) => ({ month, users: count })) ?? [];
-  const categoryData     = data?.categories.map(([name, value]) => ({ name, value })) ?? [];
-  const ratingData       = data?.rating_distribution.map(([name, value]) => ({ name, value })) ?? [];
+  // Full location cache — fetched once per browser session, never automatically refetched.
+  // staleTime: Infinity means React Query will never consider it stale and trigger a background refetch.
+  // gcTime: Infinity prevents eviction from the cache while the tab is open.
+  const { data: allData } = useQuery<CacheShape>({
+    queryKey: ALL_LOCS_KEY,
+    queryFn: () => getLocations({ page: 1, per_page: 2000 }),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+
+  const allCachedLocations = allData?.locations ?? [];
+  const isFiltered = !!(search || category || verified);
+
+  // Client-side filtering for the map — instant, no network round-trip.
+  // Uses the real-time `search` value (not debounced) so pins update as you type.
+  const mapLocations = useMemo(() => {
+    if (!isFiltered) return allCachedLocations;
+    const q = search.toLowerCase();
+    return allCachedLocations.filter((loc) => {
+      if (search) {
+        const hit =
+          loc.name.toLowerCase().includes(q) ||
+          (loc.name_ar ?? "").toLowerCase().includes(q) ||
+          (loc.address ?? "").toLowerCase().includes(q);
+        if (!hit) return false;
+      }
+      if (category && loc.category !== category) return false;
+      if (verified === "true" && !loc.is_verified) return false;
+      if (verified === "false" && loc.is_verified) return false;
+      return true;
+    });
+  }, [allCachedLocations, search, category, verified, isFiltered]);
+
+  // Optimistically patch the full cache after mutations so the map
+  // reflects changes immediately without a network refetch.
+  function patchCache(updater: (locs: Location[]) => Location[]) {
+    qc.setQueryData<CacheShape>(ALL_LOCS_KEY, (old) => {
+      if (!old) return old;
+      return { ...old, locations: updater(old.locations) };
+    });
+  }
+
+  const verifyMut = useMutation({
+    mutationFn: (id: number) => verifyLocation(id),
+    onSuccess: (_, id) => {
+      toast.success(t("loc_verified_f"));
+      patchCache((locs) => locs.map((l) => l.id === id ? { ...l, is_verified: true } : l));
+      qc.invalidateQueries({ queryKey: ["admin-locations"] });
+      qc.invalidateQueries({ queryKey: ["dashboard-stats"] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+  const unverifyMut = useMutation({
+    mutationFn: (id: number) => unverifyLocation(id),
+    onSuccess: (_, id) => {
+      toast.success(t("loc_unverify"));
+      patchCache((locs) => locs.map((l) => l.id === id ? { ...l, is_verified: false } : l));
+      qc.invalidateQueries({ queryKey: ["admin-locations"] });
+      qc.invalidateQueries({ queryKey: ["dashboard-stats"] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+  const deleteMut = useMutation({
+    mutationFn: (id: number) => deleteLocation(id),
+    onSuccess: (_, id) => {
+      toast.success(t("common_delete"));
+      setToDelete(null);
+      patchCache((locs) => locs.filter((l) => l.id !== id));
+      qc.invalidateQueries({ queryKey: ["admin-locations"] });
+      qc.invalidateQueries({ queryKey: ["dashboard-stats"] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
 
   return (
-    <div className="space-y-6 max-w-screen-xl">
-      {/* Header */}
-      <div className="animate-fade-up">
-        <h1 className="font-display text-2xl font-bold tracking-tight" style={{ color: "var(--c-ink)" }}>
-          {t("dash_title")}
-        </h1>
-        <p className="text-sm mt-0.5" style={{ color: "var(--c-ink-muted)" }}>
-          {t("dash_subtitle")}
-        </p>
-      </div>
-
-      {/* Stat cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3">
-        {isLoading ? (
-          Array.from({ length: 6 }).map((_, i) => <StatCardSkeleton key={i} />)
-        ) : (
-          <>
-            <StatCard label={t("dash_users")}     value={data?.total_users ?? 0}          icon={Users}          tone="maroon"  delay={0} />
-            <StatCard label={t("dash_locations")} value={data?.total_locations ?? 0}      icon={MapPin}         tone="maroon"  delay={60} />
-            <StatCard label={t("dash_verified")}  value={data?.verified_locations ?? 0}   icon={CheckCircle2}   tone="success" delay={120} />
-            <StatCard label={t("dash_pending")}   value={data?.unverified_locations ?? 0} icon={Clock}          tone="warn"    delay={180} />
-            <StatCard label={t("dash_reviews")}   value={data?.total_reviews ?? 0}        icon={MessageSquare}  tone="muted"   delay={240} />
-            <StatCard label={t("dash_reports")}   value={data?.total_reports ?? 0}        icon={AlertTriangle}  tone="danger"  delay={300} />
-          </>
-        )}
-      </div>
-
-      {/* Secondary stats */}
-      {data && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 animate-fade-up delay-200">
-          <div className="card p-5 flex items-center gap-4">
-            <div
-              className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0"
-              style={{ background: "rgba(128,0,0,0.12)", border: "1px solid rgba(128,0,0,0.25)" }}
-            >
-              <TrendingUp size={18} style={{ color: "var(--color-maroon-300)" }} />
-            </div>
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-widest" style={{ color: "var(--c-ink-muted)" }}>
-                {t("dash_verif_rate")}
-              </p>
-              <p className="stat-number text-2xl tabular">{data.verification_rate.toFixed(1)}%</p>
-            </div>
-          </div>
-          <div className="card p-5 flex items-center gap-4">
-            <div
-              className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0"
-              style={{ background: "var(--c-warn-bg)", border: "1px solid var(--c-warn-bdr)" }}
-            >
-              <Star size={18} style={{ color: "var(--c-warn)" }} />
-            </div>
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-widest" style={{ color: "var(--c-ink-muted)" }}>
-                {t("dash_avg_rating")}
-              </p>
-              <p className="stat-number text-2xl tabular">
-                {data.avg_rating.toFixed(1)}
-                <span className="text-sm font-body font-normal" style={{ color: "var(--c-ink-muted)" }}> / 5</span>
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Charts row 1 */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 animate-fade-up delay-300">
-        <div className="card p-5">
-          <div className="flex items-center gap-2 mb-4">
-            <BarChart3 size={15} style={{ color: "var(--color-maroon-300)" }} />
-            <h3 className="section-title">{t("dash_monthly_locs")}</h3>
-          </div>
-          {isLoading ? <div className="skeleton h-48 w-full" /> : (
-            <ResponsiveContainer width="100%" height={200}>
-              <AreaChart data={monthlyLocData}>
-                <defs>
-                  <linearGradient id="locGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%"  stopColor="#800000" stopOpacity={0.4} />
-                    <stop offset="95%" stopColor="#800000" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <XAxis dataKey="month" tick={{ fontSize: 11 }} />
-                <YAxis tick={{ fontSize: 11 }} />
-                <Tooltip />
-                <Area type="monotone" dataKey="count" stroke="#800000" strokeWidth={2} fill="url(#locGrad)" name="Locations" />
-              </AreaChart>
-            </ResponsiveContainer>
-          )}
-        </div>
-
-        <div className="card p-5">
-          <div className="flex items-center gap-2 mb-4">
-            <Users size={15} style={{ color: "var(--color-maroon-300)" }} />
-            <h3 className="section-title">{t("dash_monthly_users")}</h3>
-          </div>
-          {isLoading ? <div className="skeleton h-48 w-full" /> : (
-            <ResponsiveContainer width="100%" height={200}>
-              <AreaChart data={monthlyUsersData}>
-                <defs>
-                  <linearGradient id="userGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%"  stopColor="#B33838" stopOpacity={0.35} />
-                    <stop offset="95%" stopColor="#B33838" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <XAxis dataKey="month" tick={{ fontSize: 11 }} />
-                <YAxis tick={{ fontSize: 11 }} />
-                <Tooltip />
-                <Area type="monotone" dataKey="users" stroke="#B33838" strokeWidth={2} fill="url(#userGrad)" name="Users" />
-              </AreaChart>
-            </ResponsiveContainer>
-          )}
+    <div className="space-y-4 max-w-screen-xl">
+      <div className="flex items-center justify-between animate-fade-up">
+        <div>
+          <h1 className="font-display text-2xl font-bold tracking-tight" style={{ color: "var(--c-ink)" }}>
+            {t("loc_title")}
+          </h1>
+          <p className="text-sm mt-0.5" style={{ color: "var(--c-ink-muted)" }}>
+            {t("loc_subtitle", { n: data?.total ?? "—" })}
+          </p>
         </div>
       </div>
 
-      {/* Charts row 2 */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 animate-fade-up delay-400">
-        <div className="card p-5">
-          <h3 className="section-title mb-4">{t("dash_categories")}</h3>
-          {isLoading ? <div className="skeleton h-52 w-full" /> : (
-            <ResponsiveContainer width="100%" height={260}>
-              <PieChart>
-                <Pie data={categoryData} cx="50%" cy="44%" innerRadius={55} outerRadius={90}
-                     dataKey="value" labelLine={false} label={CustomPieLabel}
-                     stroke={pieStroke} strokeWidth={2}>
-                  {categoryData.map((_, i) => (
-                    <Cell key={i} fill={CATEGORY_COLORS[i % CATEGORY_COLORS.length]} />
-                  ))}
-                </Pie>
-                <Tooltip />
-                <Legend
-                  iconType="circle" iconSize={8}
-                  formatter={(v) => <span style={{ color: "var(--c-ink-muted)", fontSize: 11 }}>{v}</span>}
-                />
-              </PieChart>
-            </ResponsiveContainer>
-          )}
+      {/* Map */}
+      <div className="card overflow-hidden animate-fade-up delay-75" style={{ padding: 0 }}>
+        <div className="px-4 pt-3 pb-2 flex items-center justify-between" style={{ borderBottom: "1px solid var(--c-border)" }}>
+          <div className="flex items-center gap-2">
+            <MapPin size={14} style={{ color: "var(--color-maroon-300)" }} />
+            <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: "var(--c-ink-muted)" }}>
+              {isFiltered ? mapLocations.length : allCachedLocations.length} {t("loc_title").toLowerCase()} {isFiltered ? "matched" : "total"}
+            </span>
+          </div>
+          <div className="flex items-center gap-3 text-xs" style={{ color: "var(--c-ink-dim)" }}>
+            <span className="flex items-center gap-1">
+              <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: "50%", background: "#800000" }} />
+              {t("loc_verified_f")}
+            </span>
+            <span className="flex items-center gap-1">
+              <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: "50%", background: "#B33838" }} />
+              {t("loc_pending_f")}
+            </span>
+          </div>
         </div>
+        <LocationsMap
+          locations={mapLocations}
+          isFiltered={isFiltered}
+          theme={theme}
+        />
+      </div>
 
-        <div className="card p-5">
-          <h3 className="section-title mb-4">{t("dash_rating_dist")}</h3>
-          {isLoading ? <div className="skeleton h-52 w-full" /> : (
-            <ResponsiveContainer width="100%" height={220}>
-              <BarChart data={ratingData} barSize={32}>
-                <XAxis dataKey="name" tick={{ fontSize: 11 }} />
-                <YAxis tick={{ fontSize: 11 }} />
-                <Tooltip cursor={false} />
-                <Bar dataKey="value" fill="#800000" radius={[5, 5, 0, 0]} name="Reviews" activeBar={{ fill: "#B33838" }} />
-              </BarChart>
-            </ResponsiveContainer>
-          )}
+      {/* Filters */}
+      <div className="card p-4 animate-fade-up delay-100">
+        <div className="flex flex-wrap gap-3">
+          <div className="relative flex-1 min-w-52">
+            <Search size={14} className="absolute start-3 top-1/2 -translate-y-1/2" style={{ color: "var(--c-ink-muted)" }} />
+            <input
+              className="input ps-9 h-9 text-sm"
+              placeholder={t("loc_search")}
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+            />
+          </div>
+          <select className="input h-9 text-sm w-44" value={category} onChange={(e) => setCategory(e.target.value)}>
+            <option value="">{t("loc_all_cats")}</option>
+            {CATEGORIES.map((c) => (
+              <option key={c} value={c}>{localizeCategory(lang, c)}</option>
+            ))}
+          </select>
+          <select className="input h-9 text-sm w-40" value={verified} onChange={(e) => setVerified(e.target.value as "" | "true" | "false")}>
+            <option value="">{t("loc_all_status")}</option>
+            <option value="true">{t("loc_verified_f")}</option>
+            <option value="false">{t("loc_pending_f")}</option>
+          </select>
         </div>
       </div>
 
-      {/* Top + Recent */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 animate-fade-up delay-500">
-        <div className="card overflow-hidden">
-          <div className="px-5 py-4" style={{ borderBottom: "1px solid var(--c-border)" }}>
-            <h3 className="section-title">{t("dash_top_locations")}</h3>
-          </div>
-          <div>
-            {isLoading
-              ? Array.from({ length: 5 }).map((_, i) => (
-                  <div key={i} className="px-5 py-3 flex items-center gap-3" style={{ borderBottom: "1px solid var(--c-row-border)" }}>
-                    <div className="skeleton h-4 w-4 shrink-0" />
-                    <div className="skeleton h-4 flex-1" />
-                    <div className="skeleton h-4 w-16 shrink-0" />
-                  </div>
-                ))
-              : data?.top_locations.slice(0, 6).map((loc, i) => (
-                  <div
-                    key={i}
-                    className="px-5 py-3 flex items-center gap-3"
-                    style={{ borderBottom: "1px solid var(--c-row-border)" }}
-                  >
-                    <span className="font-mono text-xs w-5 shrink-0" style={{ color: "var(--c-ink-dim)" }}>
-                      #{i + 1}
-                    </span>
-                    <span className="text-sm flex-1 truncate" style={{ color: "var(--c-ink)" }}>
-                      {loc.name}
-                    </span>
-                    <span className="text-xs font-mono" style={{ color: "var(--c-warn)" }}>★ {loc.avg_rating.toFixed(1)}</span>
-                    <span className="text-xs font-mono w-14 text-end" style={{ color: "var(--c-ink-muted)" }}>
-                      {loc.review_count} {t("common_rev_per_abbr")}
-                    </span>
-                  </div>
-                ))}
-          </div>
-        </div>
-
-        <div className="card overflow-hidden">
-          <div className="px-5 py-4" style={{ borderBottom: "1px solid var(--c-border)" }}>
-            <h3 className="section-title">{t("dash_recent_reviews")}</h3>
-          </div>
-          <div>
-            {isLoading
-              ? Array.from({ length: 5 }).map((_, i) => (
-                  <div key={i} className="px-5 py-3 space-y-1.5" style={{ borderBottom: "1px solid var(--c-row-border)" }}>
-                    <div className="skeleton h-3.5 w-3/4" />
-                    <div className="skeleton h-3 w-1/2" />
-                  </div>
-                ))
-              : data?.recent_reviews.slice(0, 6).map((r) => (
-                  <div key={r.id} className="px-5 py-3" style={{ borderBottom: "1px solid var(--c-row-border)" }}>
-                    <div className="flex items-center justify-between mb-0.5">
-                      <span className="text-sm font-medium truncate max-w-[60%]" style={{ color: "var(--c-ink)" }}>
-                        {r.location_name}
+      {/* Table */}
+      <div className="card overflow-hidden animate-fade-up delay-150">
+        <div className="overflow-x-auto">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>{t("loc_col_name")}</th>
+                <th>{t("loc_col_cat")}</th>
+                <th>{t("loc_col_creator")}</th>
+                <th>{t("loc_col_rating")}</th>
+                <th>{t("loc_col_status")}</th>
+                <th>{t("loc_col_added")}</th>
+                <th style={{ textAlign: "end" }}>{t("loc_col_actions")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {isLoading ? (
+                <tr><td colSpan={7} className="p-0"><TableSkeleton rows={10} /></td></tr>
+              ) : data?.locations.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="text-center py-14 text-sm" style={{ color: "var(--c-ink-muted)" }}>
+                    <MapPin size={28} className="mx-auto mb-3 opacity-30" />
+                    {t("loc_empty")}
+                  </td>
+                </tr>
+              ) : (
+                data?.locations.map((loc) => (
+                  <tr key={loc.id}>
+                    <td>
+                      <div className="font-medium max-w-[200px] truncate" style={{ color: "var(--c-ink)" }}>{loc.name}</div>
+                      {loc.address && (
+                        <div className="text-xs truncate max-w-[200px]" style={{ color: "var(--c-ink-muted)" }}>{loc.address}</div>
+                      )}
+                    </td>
+                    <td>
+                      <span className="text-xs px-2 py-0.5 rounded-md" style={{ background: "rgba(128,0,0,0.1)", color: "var(--c-ink-muted)" }}>
+                        {localizeCategory(lang, loc.category)}
                       </span>
-                      <span className="text-xs font-mono" style={{ color: "var(--c-warn)" }}>{"★".repeat(r.rating)}</span>
-                    </div>
-                    <p className="text-xs truncate" style={{ color: "var(--c-ink-muted)" }}>
-                      {r.user} · {r.comment?.slice(0, 60) || t("rev_no_comment")}
-                    </p>
-                  </div>
-                ))}
-          </div>
+                    </td>
+                    <td>
+                      <div className="text-sm" style={{ color: "var(--c-ink)" }}>{loc.creator}</div>
+                      <div className="text-xs capitalize" style={{ color: "var(--c-ink-muted)" }}>{loc.creator_type}</div>
+                    </td>
+                    <td>
+                      <span className="font-mono text-sm" style={{ color: "var(--c-warn)" }}>★ {loc.avg_rating.toFixed(1)}</span>
+                      <span className="text-xs ms-1" style={{ color: "var(--c-ink-muted)" }}>({loc.review_count})</span>
+                    </td>
+                    <td>
+                      {loc.is_verified ? (
+                        <span className="badge badge-verified"><CheckCircle2 size={10} /> {t("loc_verified_f")}</span>
+                      ) : (
+                        <span className="badge badge-pending"><Clock size={10} /> {t("loc_pending_f")}</span>
+                      )}
+                    </td>
+                    <td className="text-xs font-mono" style={{ color: "var(--c-ink-muted)" }}>
+                      {new Date(loc.created_at).toLocaleDateString()}
+                    </td>
+                    <td>
+                      <div className="flex items-center gap-1.5 justify-end">
+                        {loc.photos.length > 0 && (
+                          <>
+                            <button
+                              onClick={() => setCvLoc(loc)}
+                              className="btn-row"
+                              aria-label={t("cv_analyze")}
+                              title={t("cv_analyze")}
+                              style={{ color: "var(--color-maroon-300)" }}
+                            >
+                              <Brain size={13} />
+                              <span className="font-mono text-[10px]">{t("cv_analyze_short")}</span>
+                            </button>
+                            <button onClick={() => setPhotoLoc(loc)} className="btn-row" aria-label="View photos">
+                              <Images size={13} />
+                              <span className="font-mono text-[10px]">{loc.photos.length}</span>
+                            </button>
+                          </>
+                        )}
+                        {loc.is_verified ? (
+                          <button onClick={() => unverifyMut.mutate(loc.id)} disabled={unverifyMut.isPending} className="btn-row row-warn">
+                            <XCircle size={13} /> {t("loc_unverify")}
+                          </button>
+                        ) : (
+                          <button onClick={() => verifyMut.mutate(loc.id)} disabled={verifyMut.isPending} className="btn-row row-success">
+                            <CheckCircle2 size={13} /> {t("loc_verify")}
+                          </button>
+                        )}
+                        <button onClick={() => setToDelete(loc)} className="btn-row row-danger" aria-label={t("common_delete")}>
+                          <Trash2 size={13} />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
         </div>
+        <Pagination page={page} total_pages={data?.pages ?? 1} onPage={setPage} />
       </div>
 
-      {error && (
-        <div className="card p-4 text-sm" style={{ borderColor: "var(--c-danger-bdr)", color: "var(--c-danger)" }}>
-          {t("dash_error")}
-        </div>
-      )}
+      <ConfirmModal
+        open={!!toDelete}
+        title={t("loc_del_title")}
+        description={t("loc_del_desc", { name: toDelete?.name ?? "" })}
+        loading={deleteMut.isPending}
+        onConfirm={() => toDelete && deleteMut.mutate(toDelete.id)}
+        onCancel={() => setToDelete(null)}
+      />
+
+      <PhotoCarouselModal
+        open={!!photoLoc}
+        photos={photoLoc?.photos ?? []}
+        locationName={photoLoc?.name ?? ""}
+        onClose={() => setPhotoLoc(null)}
+      />
+
+      <CVAnalysisModal
+        open={!!cvLoc}
+        locationId={cvLoc?.id ?? null}
+        locationName={cvLoc?.name ?? ""}
+        photos={cvLoc?.photos ?? []}
+        onClose={() => setCvLoc(null)}
+      />
     </div>
   );
 }

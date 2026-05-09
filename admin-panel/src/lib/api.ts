@@ -146,6 +146,38 @@ export interface AIInsightsResponse {
   generated_at: string;
 }
 
+// ─── CV Verification types ───────────────────────────────────────────────────
+
+/** One photo's classification result from the HF Space. */
+export interface CVPhotoResult {
+  photo_url: string;
+  success: boolean;
+  // Present when success=true
+  predicted_class?: string;
+  confidence?: number;
+  all_scores?: Record<string, number>;
+  inference_ms?: number;
+  // Present when success=false
+  error?: string;
+}
+
+/** Aggregate response from POST /api/admin/locations/<id>/analyze. */
+export interface CVAnalysisResponse {
+  location_id: number;
+  location_name: string;
+  claimed_features: string[];
+  results: CVPhotoResult[];
+  summary: {
+    total_photos: number;
+    successful: number;
+    failed: number;
+    feature_match_count: number;
+    feature_mismatch_count: number;
+  };
+  analyzed_at: string;
+  message?: string;
+}
+
 // ─── Auth ────────────────────────────────────────────────────────────────────
 
 export async function adminLogin(
@@ -259,8 +291,27 @@ export async function getAIInsights(): Promise<AIInsightsResponse> {
   return apiFetch("/api/admin/ai-insights", { method: "POST" });
 }
 
+// ─── CV Verification ─────────────────────────────────────────────────────────
+
+/**
+ * Run computer-vision analysis on every photo of a location.
+ * Returns predicted class + confidence scores for each photo.
+ *
+ * The backend proxies this to a Hugging Face Space running EfficientNet-B0.
+ * Expect ~1-3 seconds for the typical location (4 photos in parallel).
+ */
+export async function analyzeLocationPhotos(locationId: number): Promise<CVAnalysisResponse> {
+  return apiFetch(`/api/admin/locations/${locationId}/analyze`, { method: "POST" });
+}
+
 // ─── Photo URL helper ─────────────────────────────────────────────────────────
 
 export function photoUrl(filename: string): string {
+  // Photos are now stored as full Supabase public URLs in the DB,
+  // so if `filename` already starts with http(s)://, return it as-is.
+  if (filename.startsWith("http://") || filename.startsWith("https://")) {
+    return filename;
+  }
+  // Legacy fallback: locally-served upload via the Flask static route.
   return `${BASE}/api/v1/uploads/${filename}`;
 }

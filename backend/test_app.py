@@ -6,14 +6,23 @@ Basic test suite for the JOAccess Flask backend.
 These tests spin up the app in test mode using an in-memory SQLite database
 so no real Postgres/Supabase connection is needed in CI. Every test gets a
 fresh database thanks to the setup/teardown fixtures.
-
 """
 
 import json
+import os
 import pytest
 
 from app import create_app
 from extensions import db as _db
+
+# File-based SQLite path — written to /tmp so it's always writable in CI.
+# We use a file instead of :memory: because SQLAlchemy's :memory: creates
+# a NEW empty database for every connection. The test client's requests
+# each open their own connection, so they'd never see the tables created
+# by db.create_all(). A file-based DB persists across all connections
+# within the same process, solving this entirely.
+TEST_DB_PATH = "/tmp/joaccess_test.db"
+TEST_DB_URI = f"sqlite:///{TEST_DB_PATH}"
 
 
 # ─────────────────────────────────────────────
@@ -24,15 +33,14 @@ from extensions import db as _db
 def app():
     """
     Create one Flask app instance for the whole test session.
-    Uses SQLite in-memory so no real DB is required.
+    Uses a file-based SQLite DB so tables are visible across connections.
     scope="session" means this runs once — not once per test.
     """
     class TestConfig:
         TESTING = True
         SECRET_KEY = "test-secret"
         JWT_SECRET_KEY = "test-jwt-secret"
-        # In-memory SQLite — wiped clean every time the test process exits
-        SQLALCHEMY_DATABASE_URI = "sqlite:///:memory:"
+        SQLALCHEMY_DATABASE_URI = TEST_DB_URI
         SQLALCHEMY_TRACK_MODIFICATIONS = False
         UPLOAD_FOLDER = "/tmp/joaccess-test-uploads"
         MAX_CONTENT_LENGTH = 16 * 1024 * 1024
@@ -45,6 +53,11 @@ def app():
         SUPABASE_URL = ""
         SUPABASE_SERVICE_KEY = ""
         DEBUG = False
+
+    # Remove any leftover DB file from a previous run so we always
+    # start with a clean slate
+    if os.path.exists(TEST_DB_PATH):
+        os.remove(TEST_DB_PATH)
 
     application = create_app(TestConfig)
     return application
@@ -59,31 +72,32 @@ def client(app):
 @pytest.fixture(scope="session")
 def init_db(app):
     """
-    Create all tables once for the session, then drop them after all tests
-    finish. scope="session" means this runs once total, not once per test.
-
-    app.app_context() must be pushed manually here because fixtures with
-    scope="session" run outside Flask's normal request cycle — without it,
-    SQLAlchemy doesn't know which app's DB to create tables in.
+    Create all tables once at the start of the session, drop them at the end.
+    scope="session" means this runs once total, not once per test.
     """
-    ctx = app.app_context()
-    ctx.push()
-    _db.create_all()
+    with app.app_context():
+        _db.create_all()
     yield
-    _db.drop_all()
-    ctx.pop()
+    with app.app_context():
+        _db.drop_all()
+    # Clean up the DB file after all tests finish
+    if os.path.exists(TEST_DB_PATH):
+        os.remove(TEST_DB_PATH)
 
 
 @pytest.fixture(autouse=True)
 def clean_db(app, init_db):
     """
-    Roll back any DB changes after each individual test so tests don't
-    bleed into each other. autouse=True means this applies to every test
-    automatically without needing to be listed as a parameter.
+    Delete all rows from every table after each test so tests don't
+    bleed into each other. We DELETE rather than rollback because the
+    test client commits its own transactions internally.
+    autouse=True applies this to every test automatically.
     """
     yield
     with app.app_context():
-        _db.session.rollback()
+        for table in reversed(_db.metadata.sorted_tables):
+            _db.session.execute(table.delete())
+        _db.session.commit()
 
 
 # ─────────────────────────────────────────────

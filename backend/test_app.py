@@ -6,6 +6,10 @@ Basic test suite for the JOAccess Flask backend.
 These tests spin up the app in test mode using an in-memory SQLite database
 so no real Postgres/Supabase connection is needed in CI. Every test gets a
 fresh database thanks to the setup/teardown fixtures.
+
+Run locally:
+    cd backend
+    pytest -v --disable-warnings
 """
 
 import json
@@ -74,13 +78,19 @@ def init_db(app):
     """
     Create all tables once at the start of the session, drop them at the end.
     scope="session" means this runs once total, not once per test.
+
+    We import models explicitly before calling create_all() because SQLAlchemy
+    only creates tables for model classes it has seen imported. The app factory
+    imports blueprints, but if a model class hasn't been imported yet SQLAlchemy
+    doesn't know its table exists — so create_all() silently skips it.
+    Importing models here guarantees every table is registered first.
     """
     with app.app_context():
+        import models  # noqa: F401 — registers all models with SQLAlchemy metadata
         _db.create_all()
     yield
     with app.app_context():
         _db.drop_all()
-    # Clean up the DB file after all tests finish
     if os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
 

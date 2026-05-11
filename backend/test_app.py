@@ -1,3 +1,14 @@
+"""
+test_app.py
+===========
+Basic test suite for the JOAccess Flask backend.
+
+These tests spin up the app in test mode using an in-memory SQLite database
+so no real Postgres/Supabase connection is needed in CI. Every test gets a
+fresh database thanks to the setup/teardown fixtures.
+
+"""
+
 import json
 import pytest
 
@@ -50,11 +61,17 @@ def init_db(app):
     """
     Create all tables once for the session, then drop them after all tests
     finish. scope="session" means this runs once total, not once per test.
+
+    app.app_context() must be pushed manually here because fixtures with
+    scope="session" run outside Flask's normal request cycle — without it,
+    SQLAlchemy doesn't know which app's DB to create tables in.
     """
-    with app.app_context():
-        _db.create_all()
-        yield
-        _db.drop_all()
+    ctx = app.app_context()
+    ctx.push()
+    _db.create_all()
+    yield
+    _db.drop_all()
+    ctx.pop()
 
 
 @pytest.fixture(autouse=True)
@@ -64,8 +81,8 @@ def clean_db(app, init_db):
     bleed into each other. autouse=True means this applies to every test
     automatically without needing to be listed as a parameter.
     """
+    yield
     with app.app_context():
-        yield
         _db.session.rollback()
 
 
@@ -130,8 +147,8 @@ class TestHealth:
         assert resp.status_code == 200
 
     def test_root_contains_service_name(self, client):
-        data = json.loads(resp := client.get("/"))
-        assert "joaccess-backend" in str(data.data)
+        resp = client.get("/")
+        assert "joaccess-backend" in resp.data.decode()
 
     def test_health_endpoint(self, client):
         resp = client.get("/health")

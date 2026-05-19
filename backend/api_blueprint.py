@@ -1,53 +1,9 @@
-"""
-JOAccess Mobile API Blueprint (corrected)
-==========================================
-Drop this file into your Flask project root (same level as app.py).
-Then in app.py, add these two lines after jwt.init_app(app):
-
-    from api_blueprint import mobile_api
-    app.register_blueprint(mobile_api, url_prefix='/api/v1')
-
-All existing web routes remain untouched. The mobile app talks exclusively
-to /api/v1/* endpoints with JWT Bearer tokens for authentication.
-
-Fixes in this revision (vs. the original Phase 1 file):
--------------------------------------------------------
- 1. JWT identity is now always a string (flask-jwt-extended 4.6+ requires this).
-    get_jwt_identity() is wrapped so callers still receive an int.
- 2. SQLAlchemy Query.get() / get_or_404() replaced with db.session.get() +
-    explicit abort(404) — SQLAlchemy 2.0 compliance.
- 3. New /health endpoint for the mobile app's network probe.
- 4. json.loads() on stored JSON columns is wrapped in try/except so a
-    malformed DB value can't 500 the login endpoint.
- 5. ILIKE wildcard characters in user input are escaped so ?category=%
-    doesn't return the entire table.
- 6. Rating validation accepts int-like values and rejects booleans.
- 7. Photo uploads capped at 5MB each and 10 per request.
- 8. Uploaded filenames include a UUID slice so simultaneous uploads
-    never collide on disk.
- 9. Delete-location now deletes DB rows first, then removes files; file
-    errors no longer leave orphaned DB state.
-10. Server-side timestamps use datetime.utcnow() for stable filenames
-    regardless of server timezone.
-11. accessibility_settings update wrapped in try/except so unserializable
-    data can't poison the session.
-12. /my-locations now returns creator/creator_type for API symmetry.
-13. Chatbot keyword matching stays (Phase 2 replaces it with the LLM).
-14. All json.loads() calls on request-side data are wrapped defensively.
-15. Circular import eliminated — all models imported from models.py,
-    db/jwt/bcrypt imported from extensions.py, never from app.py.
-
-Plus: consistent use of db.session.rollback() in broad except blocks to
-prevent hanging transactions.
-"""
-
 from flask import Blueprint, request, jsonify, current_app, abort
 from flask_jwt_extended import (
-    create_access_token, create_refresh_token,
+    JWTManager, create_access_token, create_refresh_token,
     jwt_required, get_jwt_identity, get_jwt
 )
-from extensions import db, jwt, bcrypt
-from sqlalchemy.orm import selectinload
+from flask_bcrypt import Bcrypt
 from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
 from functools import wraps
@@ -55,10 +11,10 @@ import os
 import json
 import base64
 import uuid
-import requests
 
 mobile_api = Blueprint('mobile_api', __name__)
-
+jwt = JWTManager()
+bcrypt = Bcrypt()
 
 # ─────────────────────────────────────────────
 # Constants
@@ -95,7 +51,7 @@ def _current_user_id():
 
 def get_current_user():
     """Retrieve the User object for the currently authenticated JWT identity."""
-    from models import User
+    from app import User, db
     user_id = _current_user_id()
     if user_id is None:
         return None
@@ -203,65 +159,23 @@ def _serialize_location(loc, include_reviews=True):
     return result
 
 
-def _upload_to_supabase(img_bytes: bytes, filename: str) -> str | None:
-    """
-    Upload raw image bytes to Supabase Storage and return the public URL.
-    Returns None if the upload fails for any reason.
-
-    How it works:
-        - We call Supabase's REST Storage API directly with an HTTP PUT request.
-        - The path inside the bucket is just the filename (flat structure, no folders).
-        - The service role key bypasses RLS so the server can always write.
-        - On success Supabase returns 200 and the public URL is deterministic:
-          <SUPABASE_URL>/storage/v1/object/public/location-photos/<filename>
-    """
-    supabase_url = current_app.config.get("SUPABASE_URL", "").rstrip("/")
-    service_key  = current_app.config.get("SUPABASE_SERVICE_KEY", "")
-
-    if not supabase_url or not service_key:
-        current_app.logger.error("Supabase Storage not configured — missing env vars.")
-        return None
-
-    bucket      = "location-photos"
-    upload_url  = f"{supabase_url}/storage/v1/object/{bucket}/{filename}"
-
-    headers = {
-        "Authorization": f"Bearer {service_key}",
-        "Content-Type":  "image/jpeg",   # Supabase uses this for storage; still works for PNG
-        "x-upsert":      "true",         # overwrite if the same filename already exists
-    }
-
-    try:
-        resp = requests.put(upload_url, data=img_bytes, headers=headers, timeout=30)
-        if resp.status_code in (200, 201):
-            # Public URL is deterministic — no need to parse the response body
-            public_url = f"{supabase_url}/storage/v1/object/public/{bucket}/{filename}"
-            return public_url
-        else:
-            current_app.logger.error(
-                "Supabase Storage upload failed: %s %s", resp.status_code, resp.text
-            )
-            return None
-    except requests.RequestException as e:
-        current_app.logger.error("Supabase Storage request error: %s", e)
-        return None
-
-
 def _save_base64_photos(photos_raw, location_id):
     """
-    Decode base64 photos from the request payload and upload them to
-    Supabase Storage. Stores the returned public URL in the Photo row.
+    Save base64-encoded photos from a request payload.
 
-    Accepts either a list of dicts or a JSON string (multipart sends it
-    as a string field). Each dict must have 'data' (base64) and 'filename'.
+    Enforces size and count caps. Accepts either a list of dicts or a
+    JSON string (coming in via multipart/form-data).
+
+    Returns the number of photos successfully saved.
     """
-    from models import Photo
+    from app import Photo, db
 
     if isinstance(photos_raw, str):
         photos_raw = _safe_json_loads(photos_raw, default=[])
     if not isinstance(photos_raw, list):
         return 0
 
+    # Enforce a hard cap regardless of what the client sends
     photos_raw = photos_raw[:MAX_PHOTOS_PER_LOCATION]
 
     saved = 0
@@ -274,28 +188,31 @@ def _save_base64_photos(photos_raw, location_id):
         try:
             img_bytes = base64.b64decode(photo_data['data'])
         except (ValueError, TypeError):
-            continue
+            continue  # bad base64, skip silently
 
         if len(img_bytes) > MAX_PHOTO_BYTES:
-            continue
+            continue  # skip oversized
 
-        filename  = _generate_unique_filename(photo_data['filename'])
-        public_url = _upload_to_supabase(img_bytes, filename)
-        if not public_url:
-            continue  # upload failed, skip this photo
+        filename = _generate_unique_filename(photo_data['filename'])
+        upload_folder = current_app.config['UPLOAD_FOLDER']
+        os.makedirs(upload_folder, exist_ok=True)
+        filepath = os.path.join(upload_folder, filename)
 
-        db.session.add(Photo(location_id=location_id, filename=public_url))
+        try:
+            with open(filepath, 'wb') as f:
+                f.write(img_bytes)
+        except OSError:
+            continue  # disk error, skip
+
+        db.session.add(Photo(location_id=location_id, filename=filename))
         saved += 1
 
     return saved
 
 
 def _save_multipart_photos(files_list, location_id):
-    """
-    Read photo files from a multipart/form-data request and upload them
-    to Supabase Storage. Stores the returned public URL in the Photo row.
-    """
-    from models import Photo
+    """Save photo files from a multipart/form-data request."""
+    from app import Photo, db
 
     saved = 0
     files_list = files_list[:MAX_PHOTOS_PER_LOCATION]
@@ -304,23 +221,28 @@ def _save_multipart_photos(files_list, location_id):
         if not file or not file.filename:
             continue
 
-        # Size check — seek to end to measure, then rewind
+        # Size check — seek to end, tell, seek back
         file.seek(0, os.SEEK_END)
         size = file.tell()
         file.seek(0)
         if size > MAX_PHOTO_BYTES:
             continue
 
-        img_bytes  = file.read()
-        filename   = _generate_unique_filename(file.filename)
-        public_url = _upload_to_supabase(img_bytes, filename)
-        if not public_url:
+        filename = _generate_unique_filename(file.filename)
+        upload_folder = current_app.config['UPLOAD_FOLDER']
+        os.makedirs(upload_folder, exist_ok=True)
+        filepath = os.path.join(upload_folder, filename)
+
+        try:
+            file.save(filepath)
+        except OSError:
             continue
 
-        db.session.add(Photo(location_id=location_id, filename=public_url))
+        db.session.add(Photo(location_id=location_id, filename=filename))
         saved += 1
 
     return saved
+
 
 # ═════════════════════════════════════════════
 #  HEALTH
@@ -364,11 +286,7 @@ def api_signup():
         400: { error } on validation failure
         409: { error } on duplicate email/username
     """
-    from models import User
-
-    # Admin allow-list lives in Flask config (loaded from env via config.py).
-    # Reading it through current_app avoids a circular import from app.py.
-    admin_emails = current_app.config.get("ADMIN_EMAILS", [])
+    from app import User, db, ADMIN_EMAILS
 
     data = request.get_json(silent=True)
     if not data:
@@ -399,7 +317,7 @@ def api_signup():
     if User.query.filter_by(username=username).first():
         return jsonify({'error': 'Username already taken'}), 409
 
-    is_admin = email in admin_emails
+    is_admin = email in ADMIN_EMAILS
     hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
 
     try:
@@ -409,6 +327,7 @@ def api_signup():
             password=hashed_password,
             user_type=user_type,
             org_name=organization_name if user_type == 'organization' else None,
+
             disability=disability,
             is_admin=is_admin,
         )
@@ -442,7 +361,7 @@ def api_login():
         200: { access_token, refresh_token, user: {...} }
         401: { error } on invalid credentials
     """
-    from models import User
+    from app import User
 
     data = request.get_json(silent=True)
     if not data:
@@ -481,120 +400,6 @@ def api_login():
     }), 200
 
 
-@mobile_api.route('/auth/change-username', methods=['PUT'])
-@jwt_required()
-def api_change_username():
-    """
-    Change the current user's username.
-
-    Request JSON: { "new_username": str }
-    Returns:      { "message": str, "username": str }
-
-    Validates:
-        - new_username is provided and non-empty
-        - new_username is between 3 and 80 characters
-        - new_username only contains letters, numbers, underscores, hyphens
-        - new_username is not already taken by another user
-    """
-    from models import User
-    import re
-
-    user = get_current_user()
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({'error': 'Request body required'}), 400
-
-    new_username = (data.get('new_username') or '').strip()
-
-    # ── Validation ────────────────────────────────────────────────────
-    if not new_username:
-        return jsonify({'error': 'New username is required'}), 400
-
-    if len(new_username) < 3:
-        return jsonify({'error': 'Username must be at least 3 characters'}), 400
-
-    if len(new_username) > 80:
-        return jsonify({'error': 'Username must be 80 characters or less'}), 400
-
-    if not re.match(r'^[a-zA-Z0-9_\-\.]+$', new_username):
-        return jsonify({'error': 'Username can only contain letters, numbers, underscores, hyphens, and dots'}), 400
-
-    if new_username == user.username:
-        return jsonify({'error': 'New username is the same as your current username'}), 400
-
-    # ── Uniqueness check ──────────────────────────────────────────────
-    existing = db.session.execute(
-        db.select(User).where(User.username == new_username)
-    ).scalar_one_or_none()
-
-    if existing:
-        return jsonify({'error': 'Username is already taken'}), 409
-
-    # ── Apply change ──────────────────────────────────────────────────
-    user.username = new_username
-    db.session.commit()
-
-    return jsonify({
-        'message': 'Username updated successfully',
-        'username': user.username,
-    }), 200
-
-
-@mobile_api.route('/auth/change-password', methods=['PUT'])
-@jwt_required()
-def api_change_password():
-    """
-    Change the current user's password.
-
-    Request JSON: { "current_password": str, "new_password": str }
-    Returns:      { "message": str }
-
-    Validates:
-        - current_password is correct (verified with bcrypt)
-        - new_password is at least 8 characters
-        - new_password contains at least one number
-        - new_password is different from the current password
-    """
-    import re
-
-    user = get_current_user()
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({'error': 'Request body required'}), 400
-
-    current_password = data.get('current_password') or ''
-    new_password     = data.get('new_password') or ''
-
-    # ── Verify current password ───────────────────────────────────────
-    if not current_password:
-        return jsonify({'error': 'Current password is required'}), 400
-
-    if not bcrypt.check_password_hash(user.password, current_password):
-        return jsonify({'error': 'Current password is incorrect'}), 401
-
-    # ── Validate new password ─────────────────────────────────────────
-    if len(new_password) < 8:
-        return jsonify({'error': 'New password must be at least 8 characters'}), 400
-
-    if not re.search(r'\d', new_password):
-        return jsonify({'error': 'New password must contain at least one number'}), 400
-
-    if current_password == new_password:
-        return jsonify({'error': 'New password must be different from your current password'}), 400
-
-    # ── Apply change ──────────────────────────────────────────────────
-    user.password = bcrypt.generate_password_hash(new_password).decode('utf-8')
-    db.session.commit()
-
-    return jsonify({'message': 'Password updated successfully'}), 200
-
-
 @mobile_api.route('/auth/refresh', methods=['POST'])
 @jwt_required(refresh=True)
 def api_refresh():
@@ -607,7 +412,7 @@ def api_refresh():
         200: { access_token }
         404: { error } if the user has been deleted since the token was issued
     """
-    from models import User
+    from app import User, db
 
     user_id = _current_user_id()
     if user_id is None:
@@ -661,33 +466,24 @@ def api_me():
 @mobile_api.route('/locations', methods=['GET'])
 def api_get_locations():
     """
-    Get locations with optional filtering.
+    Get all locations with optional filtering.
 
     Query params:
         category (string): Filter by category name (substring match)
-        feature  (string): Filter to locations with this accessibility feature
+        feature (string):  Filter to locations with this accessibility feature
         verified (bool):   Filter verified only (true/false)
-        search   (string): Search by name/name_ar/address
-        limit    (int):    Max locations to return (default 200, max 500)
+        search (string):   Search by name/name_ar/address
 
     Returns:
         200: [ { ...location dict... } ]
     """
-    from models import Location
+    from app import Location
 
-    # Eager-load all relationships in a single query using SELECT IN strategy.
-    # Without this, SQLAlchemy fires one extra query per relationship per
-    # location (N+1), which means ~640 round-trips to Supabase for 160 locations.
-    # selectinload fires 1 extra query per relationship total — 4 queries instead of 640.
-    query = Location.query.options(
-        selectinload(Location.accessibility_features),
-        selectinload(Location.photos),
-        selectinload(Location.reviews),
-        selectinload(Location.creator),
-    )
+    query = Location.query
 
     category = request.args.get('category')
     if category:
+        # Escape wildcards so ?category=% doesn't return everything
         pattern = f'%{_escape_like(category)}%'
         query = query.filter(Location.category.ilike(pattern, escape='\\'))
 
@@ -705,19 +501,19 @@ def api_get_locations():
             Location.address_ar.ilike(pattern, escape='\\')
         )
 
-    # Respect limit param — default 200, hard cap 500 so nobody can dump the whole DB.
-    try:
-        limit = min(500, max(1, int(request.args.get('limit', 200))))
-    except (TypeError, ValueError):
-        limit = 200
+    locations = query.order_by(Location.created_at.desc()).all()
 
-    locations = query.order_by(Location.created_at.desc()).limit(limit).all()
-
+    # Post-filter by feature (requires joining or iterating — we iterate
+    # because the feature list per location is always tiny)
     feature_filter = request.args.get('feature')
     result = []
     for loc in locations:
         if feature_filter:
-            if not any(f.feature_type == feature_filter for f in loc.accessibility_features):
+            has_feature = any(
+                f.feature_type == feature_filter
+                for f in loc.accessibility_features
+            )
+            if not has_feature:
                 continue
         result.append(_serialize_location(loc))
 
@@ -727,14 +523,9 @@ def api_get_locations():
 @mobile_api.route('/locations/<int:location_id>', methods=['GET'])
 def api_get_location(location_id):
     """Get a single location by ID with full details."""
-    from models import Location
+    from app import Location, db
 
-    loc = db.session.get(Location, location_id, options=[
-        selectinload(Location.accessibility_features),
-        selectinload(Location.photos),
-        selectinload(Location.reviews),
-        selectinload(Location.creator),
-    ])
+    loc = db.session.get(Location, location_id)
     if not loc:
         abort(404)
 
@@ -764,14 +555,16 @@ def api_create_location():
         "photos_base64": [{"filename": "img.jpg", "data": "base64..."}]
     }
     """
-    from models import Location, AccessibilityFeature
+    from app import Location, AccessibilityFeature, db
 
     user = get_current_user()
     if not user:
         return jsonify({'error': 'Authentication required'}), 401
 
+    # Parse body from either JSON or multipart
     if request.content_type and 'multipart/form-data' in request.content_type:
         data = request.form.to_dict()
+        # Form values come as strings; decode any JSON-encoded fields
         if 'accessibility_features' in data:
             data['accessibility_features'] = _safe_json_loads(
                 data['accessibility_features'], default=[]
@@ -814,6 +607,7 @@ def api_create_location():
         db.session.add(location)
         db.session.flush()  # assign location.id without committing yet
 
+        # Accessibility features
         features_list = data.get('accessibility_features', []) or []
         if isinstance(features_list, str):
             features_list = _safe_json_loads(features_list, default=[])
@@ -826,9 +620,11 @@ def api_create_location():
                     available=True,
                 ))
 
+        # Photo uploads (multipart)
         if request.files:
             _save_multipart_photos(request.files.getlist('photos'), location.id)
 
+        # Photo uploads (base64 from JSON)
         _save_base64_photos(data.get('photos_base64', []), location.id)
 
         db.session.commit()
@@ -853,7 +649,7 @@ def api_create_location():
 @jwt_required()
 def api_update_location(location_id):
     """Update an existing location (owner or admin only)."""
-    from models import Location, AccessibilityFeature
+    from app import Location, AccessibilityFeature, db
 
     user = get_current_user()
     if not user:
@@ -891,6 +687,7 @@ def api_update_location(location_id):
             except (TypeError, ValueError):
                 return jsonify({'error': 'Invalid longitude'}), 400
 
+        # Replace accessibility features wholesale
         if 'accessibility_features' in data:
             AccessibilityFeature.query.filter_by(location_id=location.id).delete()
             features_list = data['accessibility_features']
@@ -907,6 +704,7 @@ def api_update_location(location_id):
                         available=True,
                     ))
 
+        # Append new photos (existing ones preserved)
         _save_base64_photos(data.get('photos_base64', []), location.id)
 
         db.session.commit()
@@ -938,7 +736,7 @@ def api_delete_location(location_id):
     consistent (the row is gone, orphan files are a cleanup job, not a
     correctness issue).
     """
-    from models import Location
+    from app import Location, db
 
     user = get_current_user()
     if not user:
@@ -951,6 +749,7 @@ def api_delete_location(location_id):
     if location.user_id != user.id and not user.is_admin:
         return jsonify({'error': 'You do not have permission to delete this location'}), 403
 
+    # Collect filenames BEFORE deleting the row (so the relationship resolves)
     photo_files = [p.filename for p in location.photos]
 
     try:
@@ -960,6 +759,7 @@ def api_delete_location(location_id):
         db.session.rollback()
         return jsonify({'error': 'Failed to delete location'}), 500
 
+    # Best-effort file cleanup — errors logged but don't fail the request
     upload_folder = current_app.config['UPLOAD_FOLDER']
     for filename in photo_files:
         filepath = os.path.join(upload_folder, filename)
@@ -990,7 +790,7 @@ def api_add_review(location_id):
         "comment": str (optional)
     }
     """
-    from models import Location, Review
+    from app import Location, Review, db
 
     user = get_current_user()
     if not user:
@@ -1003,6 +803,9 @@ def api_add_review(location_id):
     if not data:
         return jsonify({'error': 'Request body required'}), 400
 
+    # Rating validation — accept numeric types but reject booleans.
+    # isinstance(True, int) is True in Python, which would otherwise
+    # let {"rating": true} through as a 1-star review.
     raw_rating = data.get('rating')
     if isinstance(raw_rating, bool) or raw_rating is None:
         return jsonify({'error': 'Rating must be a number between 1 and 5'}), 400
@@ -1046,7 +849,7 @@ def api_delete_review(review_id):
     Delete a review. Owner can delete their own; admin can delete any
     but must provide a reason (which gets logged).
     """
-    from models import Review
+    from app import Review, db
 
     user = get_current_user()
     if not user:
@@ -1094,6 +897,7 @@ def api_report_location(location_id):
     Request JSON: { "reason": str (required), "description": str (optional) }
     """
     from models import Location, Report
+    from extensions import db
 
     user = get_current_user()
     if not user:
@@ -1119,9 +923,10 @@ def api_report_location(location_id):
         )
         db.session.add(report)
         db.session.commit()
-    except Exception:
+    except Exception as e:
         db.session.rollback()
-        return jsonify({'error': 'Failed to submit report'}), 500
+        # Include exception details to prevent silent failures in the future
+        return jsonify({'error': f'Failed to submit report: {str(e)}'}), 500
 
     return jsonify({'success': True, 'message': 'Report submitted'}), 201
 
@@ -1131,401 +936,91 @@ def api_report_location(location_id):
 # ═════════════════════════════════════════════
 
 @mobile_api.route('/chatbot', methods=['POST'])
-@jwt_required()
 def api_chatbot():
     """
-    AI-powered accessibility assistant for JOAccess (Rima).
+    Keyword-matching chatbot (Phase 2 replaces this with the LLM).
 
-    Flow:
-        1. Load the current user's profile from DB for personalisation
-        2. Query the DB for the top 20 most relevant verified locations
-           (filtered by category/feature keywords extracted from the message)
-           including their avg rating and top accessibility features
-        3. Build a rich system prompt with user context + location data
-        4. Call Gemma 4 via OpenRouter
-        5. Parse the JSON response — which may include a list of location IDs
-           the model chose to recommend
-        6. Return { response, suggestions, locations } to the mobile app
-
-    Request JSON:  { "message": str, "lang": "en" | "ar" }
-    Response JSON: {
-        "response":    str,
-        "suggestions": [str, ...],       -- 2-4 follow-up chips
-        "locations":   [                 -- 0-5 recommended locations
-            {
-                "id": int,
-                "name": str,
-                "name_ar": str,
-                "address": str,
-                "address_ar": str,
-                "category": str,
-                "latitude": float,
-                "longitude": float,
-                "avg_rating": float,
-                "review_count": int,
-                "photo_url": str | null,
-                "features": [str, ...]
-            }
-        ]
-    }
+    Request JSON: { "message": str (required), "lang": "en" | "ar" }
+    Returns:     { "response": str, "suggestions": [str, ...] }
     """
-    from models import User, Location, AccessibilityFeature, Review, Photo
-    from sqlalchemy import select, func
-    from sqlalchemy.orm import selectinload
-
     data = request.get_json(silent=True)
     if not data:
         return jsonify({'error': 'Request body required'}), 400
 
-    message = (data.get('message') or '').strip()
-    lang    = data.get('lang', 'en')
+    message = (data.get('message') or '').lower().strip()
+    lang = data.get('lang', 'en')
 
-    if not message:
-        return jsonify({'error': 'message is required'}), 400
-
-    api_key = current_app.config.get('ASSISTANT_API_KEY', '')
-    if not api_key:
-        return jsonify({'error': 'Chatbot service not configured.'}), 503
-
-    # ── 1. Load current user profile ──────────────────────────────────
-    # get_current_user() reads the JWT sub claim and returns the User row.
-    # We use this to personalise the system prompt.
-    current_user = get_current_user()
-
-    user_context = "Unknown user."
-    if current_user:
-        parts = [f"Name: {current_user.username}"]
-        if current_user.user_type == 'organization' and current_user.org_name:
-            parts.append(f"Organization: {current_user.org_name}")
-        if current_user.disability:
-            parts.append(f"Disability/needs: {current_user.disability}")
-        parts.append(f"Account type: {current_user.user_type}")
-        user_context = " | ".join(parts)
-
-    # ── 2. Query relevant locations from DB ───────────────────────────
-    # We score relevance by checking if the user's message contains any
-    # category names or feature keywords, then return the top 20 verified
-    # locations sorted by average rating descending.
-    #
-    # This is a simple but effective strategy: the model gets real data
-    # from the actual DB, so its recommendations are grounded in truth.
-
-    # Map readable keywords → DB category strings
-    CATEGORY_KEYWORDS = {
-        'restaurant': 'Restaurants & Cafes',
-        'cafe': 'Restaurants & Cafes',
-        'مطعم': 'Restaurants & Cafes',
-        'مقهى': 'Restaurants & Cafes',
-        'mall': 'Shopping Malls',
-        'shopping': 'Shopping Malls',
-        'تسوق': 'Shopping Malls',
-        'مول': 'Shopping Malls',
-        'hospital': 'Healthcare',
-        'clinic': 'Healthcare',
-        'healthcare': 'Healthcare',
-        'مستشفى': 'Healthcare',
-        'صحة': 'Healthcare',
-        'school': 'Educational',
-        'university': 'Educational',
-        'جامعة': 'Educational',
-        'مدرسة': 'Educational',
-        'government': 'Government Buildings',
-        'ministry': 'Government Buildings',
-        'حكومة': 'Government Buildings',
-        'وزارة': 'Government Buildings',
-        'mosque': 'Religious Places',
-        'church': 'Religious Places',
-        'مسجد': 'Religious Places',
-        'كنيسة': 'Religious Places',
-        'park': 'Parks',
-        'حديقة': 'Parks',
-        'hotel': 'Hotels',
-        'فندق': 'Hotels',
-        'bank': 'Banks & ATMs',
-        'بنك': 'Banks & ATMs',
-        'transport': 'Transportation',
-        'bus': 'Transportation',
-        'مواصلات': 'Transportation',
-        'باص': 'Transportation',
-        'sport': 'Sports & Fitness',
-        'gym': 'Sports & Fitness',
-        'رياضة': 'Sports & Fitness',
-        'tourist': 'Tourist Attractions',
-        'سياحة': 'Tourist Attractions',
+    responses_en = {
+        'wheelchair': {
+            'response': 'I can help you find wheelchair-accessible locations! We have locations with wheelchair ramps, accessible entrances, and elevators. Would you like me to show you restaurants, malls, or other specific types of locations?',
+            'suggestions': ['Restaurants', 'Shopping Malls', 'Healthcare', 'Parks'],
+        },
+        'parking': {
+            'response': 'Looking for accessible parking? I can show you locations that have designated accessible parking spots. What type of place are you looking for?',
+            'suggestions': ['Supermarkets', 'Shopping Malls', 'Government Buildings', 'Healthcare'],
+        },
+        'restroom': {
+            'response': 'I can help you find locations with accessible restrooms. These locations have properly equipped facilities for people with disabilities. What category interests you?',
+            'suggestions': ['Restaurants & Cafes', 'Shopping Malls', 'Tourist Attractions', 'Parks'],
+        },
+        'visual': {
+            'response': 'For visual impairments, I recommend locations with braille signage and audio assistance. Would you like to see places in any specific category?',
+            'suggestions': ['Government Buildings', 'Healthcare', 'Educational', 'Transportation'],
+        },
+        'restaurant': {
+            'response': 'Great choice! I can show you accessible restaurants and cafes in Jordan. Many have wheelchair access, accessible restrooms, and wide doorways. Would you like to see them on the map?',
+            'suggestions': ['Show on map', 'Filter by area', 'See reviews'],
+        },
+        'help': {
+            'response': "I'm here to help you find accessible locations in Jordan! You can ask me about:\n• Wheelchair accessibility\n• Accessible parking\n• Restrooms\n• Braille signage\n• Audio assistance\n• Or any specific type of location",
+            'suggestions': ['Restaurants', 'Healthcare', 'Shopping', 'Transportation'],
+        },
     }
 
-    # Map readable keywords → DB feature_type strings
-    FEATURE_KEYWORDS = {
-        'wheelchair': 'wheelchair_ramp',
-        'ramp': 'wheelchair_ramp',
-        'كرسي': 'wheelchair_ramp',
-        'منحدر': 'wheelchair_ramp',
-        'parking': 'accessible_parking',
-        'موقف': 'accessible_parking',
-        'restroom': 'accessible_restroom',
-        'bathroom': 'accessible_restroom',
-        'toilet': 'accessible_restroom',
-        'دورة مياه': 'accessible_restroom',
-        'حمام': 'accessible_restroom',
-        'braille': 'braille_signage',
-        'برايل': 'braille_signage',
-        'elevator': 'elevator',
-        'lift': 'elevator',
-        'مصعد': 'elevator',
-        'audio': 'audio_assistance',
-        'صوتي': 'audio_assistance',
-        'door': 'wide_doorways',
-        'باب': 'wide_doorways',
-        'entrance': 'accessible_entrance',
-        'مدخل': 'accessible_entrance',
-        'sign language': 'sign_language_support',
-        'لغة إشارة': 'sign_language_support',
+    responses_ar = {
+        'كرسي': {
+            'response': 'يمكنني مساعدتك في إيجاد أماكن يمكن الوصول إليها بكرسي متحرك! لدينا أماكن مع منحدرات ومداخل ومصاعد. هل تريد أن أريك مطاعم أو مراكز تسوق أو أنواع أخرى من الأماكن؟',
+            'suggestions': ['مطاعم ومقاهي', 'مراكز تسوق', 'رعاية صحية', 'حدائق'],
+        },
+        'موقف': {
+            'response': 'تبحث عن مواقف سيارات مخصصة؟ يمكنني أن أريك أماكن بها مواقف مخصصة لذوي الإعاقة. ما نوع المكان الذي تبحث عنه؟',
+            'suggestions': ['سوبرماركت', 'مراكز تسوق', 'مباني حكومية', 'رعاية صحية'],
+        },
+        'دورة مياه': {
+            'response': 'يمكنني مساعدتك في إيجاد أماكن بها دورات مياه مجهزة. هذه الأماكن لديها مرافق مناسبة لذوي الإعاقة. أي فئة تهمك؟',
+            'suggestions': ['مطاعم ومقاهي', 'مراكز تسوق', 'مناطق سياحية', 'حدائق'],
+        },
+        'بصر': {
+            'response': 'بالنسبة للإعاقات البصرية، أنصح بأماكن بها لافتات بطريقة برايل ومساعدة صوتية. هل تريد رؤية أماكن في فئة معينة؟',
+            'suggestions': ['مباني حكومية', 'رعاية صحية', 'تعليمية', 'مواصلات'],
+        },
+        'مطعم': {
+            'response': 'اختيار رائع! يمكنني أن أريك مطاعم ومقاهي يمكن الوصول إليها في الأردن. كثير منها لديه منحدرات ودورات مياه مجهزة وأبواب واسعة. هل تريد رؤيتها على الخريطة؟',
+            'suggestions': ['عرض على الخريطة', 'تصفية حسب المنطقة', 'مشاهدة التقييمات'],
+        },
+        'مساعدة': {
+            'response': 'أنا هنا لمساعدتك في إيجاد أماكن يمكن الوصول إليها في الأردن! يمكنك أن تسألني عن:\n• إمكانية الوصول بكرسي متحرك\n• مواقف السيارات المخصصة\n• دورات المياه\n• لافتات برايل\n• المساعدة الصوتية\n• أو أي نوع محدد من الأماكن',
+            'suggestions': ['مطاعم', 'رعاية صحية', 'تسوق', 'مواصلات'],
+        },
     }
 
-    msg_lower = message.lower()
+    responses = responses_ar if lang == 'ar' else responses_en
 
-    # Find which categories the message is asking about
-    matched_categories = list({
-        cat for kw, cat in CATEGORY_KEYWORDS.items()
-        if kw in msg_lower
-    })
+    for key in responses.keys():
+        if key in message:
+            return jsonify(responses[key]), 200
 
-    # Find which features the message is asking about
-    matched_features = list({
-        feat for kw, feat in FEATURE_KEYWORDS.items()
-        if kw in msg_lower
-    })
-
-    # Build the location query
-    # We always start with verified locations only.
-    # If the user asked about specific categories, filter to those.
-    # If they asked about specific features, only include locations
-    # that have those features marked as available.
-    loc_query = (
-        db.session.query(Location)
-        .options(
-            selectinload(Location.accessibility_features),
-            selectinload(Location.photos),
-            selectinload(Location.reviews),
-        )
-    )
-
-    if matched_categories:
-        loc_query = loc_query.filter(Location.category.in_(matched_categories))
-
-    if matched_features:
-        # Inner join to AccessibilityFeature — only locations that have
-        # at least one of the requested features available
-        loc_query = loc_query.join(
-            AccessibilityFeature,
-            (AccessibilityFeature.location_id == Location.id) &
-            (AccessibilityFeature.feature_type.in_(matched_features)) &
-            (AccessibilityFeature.available == True)
-        ).distinct()
-
-    # Pull up to 20 locations; we'll sort by avg rating in Python
-    # (SQLAlchemy aggregate + eager load in same query is messy)
-    candidate_locations = loc_query.limit(40).all()
-
-    # Sort by avg rating descending, take top 20
-    def avg_rating_for(loc):
-        if not loc.reviews:
-            return 0.0
-        return sum(r.rating for r in loc.reviews) / len(loc.reviews)
-
-    candidate_locations.sort(key=avg_rating_for, reverse=True)
-    top_locations = candidate_locations[:20]
-
-    # ── 3. Serialize locations for the prompt ─────────────────────────
-    # We pass a compact summary to the model so it knows what's available.
-    # Each entry has: id, name, category, avg_rating, review_count, features.
-    # The model must reference IDs in its response so we can look them up.
-
-    location_summaries = []
-    location_map = {}  # id → full serialized dict for the response
-
-    for loc in top_locations:
-        avg_r = avg_rating_for(loc)
-        review_count = len(loc.reviews)
-        available_features = [
-            f.feature_type for f in loc.accessibility_features if f.available
-        ]
-        first_photo = loc.photos[0].filename if loc.photos else None
-
-        # Compact string for the prompt
-        verified_label = "✓ verified" if loc.is_verified else "⚠ unverified"
-        summary = (
-            f"[ID:{loc.id}] {loc.name} ({loc.category}) | "
-            f"{verified_label} | "
-            f"Rating: {round(avg_r, 1)}/5 ({review_count} reviews) | "
-            f"Address: {loc.address or 'N/A'} | "
-            f"Features: {', '.join(available_features) or 'none listed'}"
-        )
-        location_summaries.append(summary)
-
-        # Full dict for the API response
-        location_map[loc.id] = {
-            'id':           loc.id,
-            'name':         loc.name,
-            'name_ar':      loc.name_ar,
-            'address':      loc.address or '',
-            'address_ar':   loc.address_ar or '',
-            'category':     loc.category,
-            'latitude':     loc.latitude,
-            'longitude':    loc.longitude,
-            'avg_rating':   round(avg_r, 1),
-            'review_count': review_count,
-            'photo_url':    first_photo,
-            'features':     available_features,
-            'is_verified':  loc.is_verified,
-        }
-
-    locations_context = "\n".join(location_summaries) if location_summaries else "No matching locations found in the database."
-
-    # ── 4. Build the system prompt ────────────────────────────────────
-    system_prompt = f"""You are Rima (ريما), a warm and helpful accessibility assistant for JOAccess — a community-driven platform that maps accessible locations across Jordan for people with disabilities and mobility needs.
-
-CURRENT USER PROFILE:
-{user_context}
-Use this to personalise your answers. For example, if the user has a visual impairment, emphasise braille signage and audio assistance features. If they use a wheelchair, prioritise ramp and elevator availability. Address the user by their first name when natural.
-
-AVAILABLE LOCATIONS FROM THE DATABASE (verified, sorted by rating):
-{locations_context}
-
-Each location is shown as: [ID:number] Name (Category) | Rating | Address | Accessibility Features
-These are REAL locations from the JOAccess database. Only recommend locations from this list. If the list is empty or none are suitable, say so honestly.
-
-ABOUT JOACCESS:
-- JOAccess maps accessible places across Jordan for people with disabilities
-- Users can filter by category and accessibility features, add locations, and write reviews
-- Accessibility features tracked: wheelchair_ramp, accessible_parking, accessible_restroom, elevator, braille_signage, audio_assistance, wide_doorways, accessible_entrance, accessible_seating, sign_language_support
-- Categories: Restaurants & Cafes, Shopping Malls, Healthcare, Educational, Government Buildings, Religious Places, Transportation, Tourist Attractions, Parks, Hotels, Banks & ATMs, Sports & Fitness, Entertainment
-
-JORDAN ACCESSIBILITY CONTEXT:
-- Accessibility infrastructure in Jordan is improving but still inconsistent outside Amman
-- Abdali Boulevard, Mecca Mall, City Mall are among the more accessible areas in Amman
-- Public transportation has limited accessibility; taxis are often more practical
-- Major hospitals like Jordan University Hospital and King Hussein Medical Center have better accessibility
-
-LANGUAGE RULES — CRITICAL:
-- Detect the language and dialect from the user's message
-- If the user writes in Jordanian Arabic dialect (عامية أردنية), respond in Jordanian Arabic dialect — NOT formal Modern Standard Arabic
-- If the user writes in formal Arabic (فصحى), respond in formal Arabic
-- If the user writes in English, respond in English
-- NEVER mix languages in a single response
-- Suggestions must match the language of your response
-
-WHAT YOU DO NOT DO:
-- Do not invent location names, addresses, or details not in the provided list
-- Do not discuss topics unrelated to accessibility, disability, or JOAccess
-- Do not give medical advice
-- Do not remember previous conversations — each session starts fresh
-- If asked something off-topic, politely redirect
-
-MANDATORY JSON RESPONSE FORMAT:
-You MUST respond with ONLY a valid JSON object — no markdown, no code fences, no text before or after. The JSON must have exactly these three keys:
-
-{{
-  "response": "Your full answer as a string. Use \\n for line breaks.",
-  "suggestions": ["Short chip 1", "Short chip 2", "Short chip 3"],
-  "recommended_location_ids": [1, 2, 3]
-}}
-
-- "response": Your helpful answer. Mention recommended locations by name naturally in the text.
-- "suggestions": 2-4 SHORT follow-up chips (3-6 words each) in the same language as the response.
-- "recommended_location_ids": Array of location IDs (integers) from the database list above that are most relevant to this message. Include 0-5 IDs. If no locations are relevant, use an empty array [].
-
-RESPOND WITH JSON ONLY. NO OTHER TEXT."""
-
-    # ── 5. Call OpenRouter (Gemma 4) ──────────────────────────────────
-    url = 'https://openrouter.ai/api/v1/chat/completions'
-    payload = {
-        'model': 'google/gemma-4-31b-it',
-        'messages': [
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user',   'content': message},
-        ],
-        'temperature': 0.6,
-        'max_tokens':  800,
-    }
-    headers = {
-        'Authorization': f'Bearer {api_key}',
-        'Content-Type':  'application/json',
-        'HTTP-Referer':  'https://joaccess-app.com',
-        'X-Title':       'JOAccess Mobile Assistant',
-    }
-
-    # ── Fallback if anything goes wrong ───────────────────────────────
-    fallback = {
+    default_response = {
         'en': {
-            'response':    "Sorry, I'm having trouble connecting right now. Please try again in a moment.",
-            'suggestions': ['Wheelchair access', 'Accessible parking', 'Find restaurants', 'Help'],
-            'locations':   [],
+            'response': "I'm here to help you find accessible locations in Jordan. You can ask me about wheelchair accessibility, parking, restrooms, or specific types of locations like restaurants, malls, or healthcare facilities. How can I assist you?",
+            'suggestions': ['Wheelchair access', 'Accessible parking', 'Restaurants', 'Healthcare'],
         },
         'ar': {
-            'response':    'عذراً، في مشكلة بالاتصال هلق. جرب مرة ثانية بعد شوي.',
-            'suggestions': ['كرسي متحرك', 'مواقف مخصصة', 'مطاعم', 'مساعدة'],
-            'locations':   [],
+            'response': 'أنا هنا لمساعدتك في إيجاد أماكن يمكن الوصول إليها في الأردن. يمكنك أن تسألني عن إمكانية الوصول بكرسي متحرك، مواقف السيارات، دورات المياه، أو أنواع محددة من الأماكن مثل المطاعم أو المراكز الصحية. كيف يمكنني مساعدتك؟',
+            'suggestions': ['كرسي متحرك', 'مواقف مخصصة', 'مطاعم', 'رعاية صحية'],
         },
     }
-
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=35)
-        resp.raise_for_status()
-
-        raw_content = resp.json()['choices'][0]['message']['content'].strip()
-
-        # Strip markdown code fences defensively
-        if raw_content.startswith('```'):
-            raw_content = raw_content.split('```')[1]
-            if raw_content.startswith('json'):
-                raw_content = raw_content[4:]
-            raw_content = raw_content.strip()
-
-        result = json.loads(raw_content)
-
-        # Validate required fields
-        if not isinstance(result.get('response'), str):
-            raise ValueError('Missing response string')
-        if not isinstance(result.get('suggestions'), list):
-            result['suggestions'] = []
-        if not isinstance(result.get('recommended_location_ids'), list):
-            result['recommended_location_ids'] = []
-
-        # Cap and clean suggestions
-        result['suggestions'] = [str(s) for s in result['suggestions'][:4]]
-
-        # ── 6. Resolve recommended IDs → full location objects ────────
-        # The model returns IDs; we look them up in the map we built
-        # earlier so the mobile app gets full location data.
-        recommended_ids = [
-            int(i) for i in result['recommended_location_ids']
-            if str(i).isdigit() or isinstance(i, int)
-        ][:5]  # cap at 5
-
-        resolved_locations = [
-            location_map[lid]
-            for lid in recommended_ids
-            if lid in location_map
-        ]
-
-        return jsonify({
-            'response':    result['response'],
-            'suggestions': result['suggestions'],
-            'locations':   resolved_locations,
-        }), 200
-
-    except requests.exceptions.Timeout:
-        current_app.logger.error('Chatbot: OpenRouter timed out')
-        return jsonify(fallback.get(lang, fallback['en'])), 200
-
-    except (requests.exceptions.RequestException, KeyError, IndexError) as e:
-        current_app.logger.error('Chatbot: OpenRouter request error: %s', e)
-        return jsonify(fallback.get(lang, fallback['en'])), 200
-
-    except (json.JSONDecodeError, ValueError) as e:
-        current_app.logger.error('Chatbot: Could not parse model JSON: %s | raw: %s', e, raw_content[:200])
-        return jsonify(fallback.get(lang, fallback['en'])), 200
+    return jsonify(default_response.get(lang, default_response['en'])), 200
 
 
 # ═════════════════════════════════════════════
@@ -1557,6 +1052,8 @@ def api_update_accessibility_settings():
         "colorBlindMode": "none" | "protanopia" | "deuteranopia" | "tritanopia"
     }
     """
+    from app import db
+
     user = get_current_user()
     if not user:
         return jsonify({'error': 'User not found'}), 404
@@ -1566,6 +1063,7 @@ def api_update_accessibility_settings():
         return jsonify({'error': 'Request body required'}), 400
 
     try:
+        # Ensure it's serializable before we commit
         serialized = json.dumps(data)
         user.accessibility_settings = serialized
         db.session.commit()
@@ -1587,7 +1085,7 @@ def api_update_accessibility_settings():
 @jwt_required()
 def api_my_locations():
     """Get all locations created by the current user."""
-    from models import Location
+    from app import Location
 
     user = get_current_user()
     if not user:
@@ -1598,6 +1096,8 @@ def api_my_locations():
                  .order_by(Location.created_at.desc())
                  .all())
 
+    # Use the same serializer the other endpoints use — guarantees field
+    # parity between /locations and /my-locations.
     return jsonify([_serialize_location(loc, include_reviews=False) for loc in locations]), 200
 
 
@@ -1613,6 +1113,7 @@ def api_serve_upload(filename):
     """
     from flask import send_from_directory
 
+    # Prevent path traversal — only serve filenames that are safe basenames
     safe_name = os.path.basename(filename)
     if safe_name != filename or not safe_name:
         abort(404)

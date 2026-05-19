@@ -51,7 +51,8 @@ def _current_user_id():
 
 def get_current_user():
     """Retrieve the User object for the currently authenticated JWT identity."""
-    from app import User, db
+    from models import User       # ← fixed: was "from app import User, db"
+    from extensions import db     # ← fixed: was "from app import User, db"
     user_id = _current_user_id()
     if user_id is None:
         return None
@@ -168,7 +169,8 @@ def _save_base64_photos(photos_raw, location_id):
 
     Returns the number of photos successfully saved.
     """
-    from app import Photo, db
+    from models import Photo      # ← fixed: was "from app import Photo, db"
+    from extensions import db     # ← fixed
 
     if isinstance(photos_raw, str):
         photos_raw = _safe_json_loads(photos_raw, default=[])
@@ -212,7 +214,8 @@ def _save_base64_photos(photos_raw, location_id):
 
 def _save_multipart_photos(files_list, location_id):
     """Save photo files from a multipart/form-data request."""
-    from app import Photo, db
+    from models import Photo      # ← fixed: was "from app import Photo, db"
+    from extensions import db     # ← fixed
 
     saved = 0
     files_list = files_list[:MAX_PHOTOS_PER_LOCATION]
@@ -286,7 +289,9 @@ def api_signup():
         400: { error } on validation failure
         409: { error } on duplicate email/username
     """
-    from app import User, db, ADMIN_EMAILS
+    from models import User           # ← fixed: was "from app import User, db, ADMIN_EMAILS"
+    from extensions import db         # ← fixed
+    from app import ADMIN_EMAILS      # ← ADMIN_EMAILS stays in app.py (it's config, not a model)
 
     data = request.get_json(silent=True)
     if not data:
@@ -327,7 +332,6 @@ def api_signup():
             password=hashed_password,
             user_type=user_type,
             org_name=organization_name if user_type == 'organization' else None,
-
             disability=disability,
             is_admin=is_admin,
         )
@@ -361,7 +365,7 @@ def api_login():
         200: { access_token, refresh_token, user: {...} }
         401: { error } on invalid credentials
     """
-    from app import User
+    from models import User       # ← fixed: was "from app import User"
 
     data = request.get_json(silent=True)
     if not data:
@@ -412,7 +416,8 @@ def api_refresh():
         200: { access_token }
         404: { error } if the user has been deleted since the token was issued
     """
-    from app import User, db
+    from models import User       # ← fixed: was "from app import User, db"
+    from extensions import db     # ← fixed
 
     user_id = _current_user_id()
     if user_id is None:
@@ -477,7 +482,7 @@ def api_get_locations():
     Returns:
         200: [ { ...location dict... } ]
     """
-    from app import Location
+    from models import Location   # ← fixed: was "from app import Location"
 
     query = Location.query
 
@@ -523,7 +528,8 @@ def api_get_locations():
 @mobile_api.route('/locations/<int:location_id>', methods=['GET'])
 def api_get_location(location_id):
     """Get a single location by ID with full details."""
-    from app import Location, db
+    from models import Location   # ← fixed: was "from app import Location, db"
+    from extensions import db     # ← fixed
 
     loc = db.session.get(Location, location_id)
     if not loc:
@@ -555,7 +561,8 @@ def api_create_location():
         "photos_base64": [{"filename": "img.jpg", "data": "base64..."}]
     }
     """
-    from app import Location, AccessibilityFeature, db
+    from models import Location, AccessibilityFeature   # ← fixed: was "from app import ..."
+    from extensions import db                           # ← fixed
 
     user = get_current_user()
     if not user:
@@ -649,7 +656,8 @@ def api_create_location():
 @jwt_required()
 def api_update_location(location_id):
     """Update an existing location (owner or admin only)."""
-    from app import Location, AccessibilityFeature, db
+    from models import Location, AccessibilityFeature   # ← fixed: was "from app import ..."
+    from extensions import db                           # ← fixed
 
     user = get_current_user()
     if not user:
@@ -736,7 +744,8 @@ def api_delete_location(location_id):
     consistent (the row is gone, orphan files are a cleanup job, not a
     correctness issue).
     """
-    from app import Location, db
+    from models import Location   # ← fixed: was "from app import Location, db"
+    from extensions import db     # ← fixed
 
     user = get_current_user()
     if not user:
@@ -790,7 +799,8 @@ def api_add_review(location_id):
         "comment": str (optional)
     }
     """
-    from app import Location, Review, db
+    from models import Location, Review   # ← fixed: was "from app import Location, Review, db"
+    from extensions import db             # ← fixed
 
     user = get_current_user()
     if not user:
@@ -849,7 +859,8 @@ def api_delete_review(review_id):
     Delete a review. Owner can delete their own; admin can delete any
     but must provide a reason (which gets logged).
     """
-    from app import Review, db
+    from models import Review     # ← fixed: was "from app import Review, db"
+    from extensions import db     # ← fixed
 
     user = get_current_user()
     if not user:
@@ -896,8 +907,8 @@ def api_report_location(location_id):
 
     Request JSON: { "reason": str (required), "description": str (optional) }
     """
-    from models import Location, Report
-    from extensions import db
+    from models import Location, Report   # already correct
+    from extensions import db             # already correct
 
     user = get_current_user()
     if not user:
@@ -925,7 +936,6 @@ def api_report_location(location_id):
         db.session.commit()
     except Exception as e:
         db.session.rollback()
-        # Include exception details to prevent silent failures in the future
         return jsonify({'error': f'Failed to submit report: {str(e)}'}), 500
 
     return jsonify({'success': True, 'message': 'Report submitted'}), 201
@@ -1052,7 +1062,7 @@ def api_update_accessibility_settings():
         "colorBlindMode": "none" | "protanopia" | "deuteranopia" | "tritanopia"
     }
     """
-    from app import db
+    from extensions import db     # ← fixed: was "from app import db"
 
     user = get_current_user()
     if not user:
@@ -1085,7 +1095,7 @@ def api_update_accessibility_settings():
 @jwt_required()
 def api_my_locations():
     """Get all locations created by the current user."""
-    from app import Location
+    from models import Location   # ← fixed: was "from app import Location"
 
     user = get_current_user()
     if not user:

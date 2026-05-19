@@ -289,9 +289,12 @@ def api_signup():
         400: { error } on validation failure
         409: { error } on duplicate email/username
     """
-    from models import User           # ← fixed: was "from app import User, db, ADMIN_EMAILS"
-    from extensions import db         # ← fixed
-    from app import ADMIN_EMAILS      # ← ADMIN_EMAILS stays in app.py (it's config, not a model)
+    from models import User       # ← fixed: was "from app import User, db, ADMIN_EMAILS"
+    from extensions import db     # ← fixed
+    # ADMIN_EMAILS lives in Config, accessed via current_app.config at request time.
+    # Never import it from app.py — app.py uses a factory pattern so there's no
+    # module-level ADMIN_EMAILS variable to import.
+    ADMIN_EMAILS = current_app.config.get('ADMIN_EMAILS', [])
 
     data = request.get_json(silent=True)
     if not data:

@@ -4,6 +4,7 @@ from flask_jwt_extended import (
     jwt_required, get_jwt_identity, get_jwt
 )
 from flask_bcrypt import Bcrypt
+from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
 from functools import wraps
@@ -51,8 +52,8 @@ def _current_user_id():
 
 def get_current_user():
     """Retrieve the User object for the currently authenticated JWT identity."""
-    from models import User       # ← fixed: was "from app import User, db"
-    from extensions import db     # ← fixed: was "from app import User, db"
+    from models import User
+    from extensions import db
     user_id = _current_user_id()
     if user_id is None:
         return None
@@ -107,11 +108,42 @@ def admin_required_api(fn):
     return wrapper
 
 
+def _location_query_options():
+    """
+    Eagerly load every relationship that _serialize_location touches.
+
+    Without this, each attribute access (loc.photos, loc.reviews, etc.)
+    fires a separate lazy-load SQL query per location — the classic N+1
+    problem. Under a slow or strict Supabase staging connection this
+    causes Gunicorn workers to time out and crash with SIGKILL.
+
+    selectinload issues one extra query per relationship for the whole
+    result set (e.g. "SELECT * FROM photos WHERE location_id IN (1,2,3)")
+    instead of one query per row, which is dramatically more efficient.
+
+    We also chain .selectinload(Review.author) so that accessing
+    r.author inside _serialize_location doesn't fire yet another round
+    of lazy loads for every review.
+    """
+    from models import Location, Review
+    return [
+        selectinload(Location.photos),
+        selectinload(Location.accessibility_features),
+        selectinload(Location.reviews).selectinload(Review.author),
+        selectinload(Location.creator),
+    ]
+
+
 def _serialize_location(loc, include_reviews=True):
     """
     Consistent dict representation of a Location for API responses.
     Centralized here so /locations, /locations/:id, /my-locations all
     return the same field set.
+
+    IMPORTANT: all relationships (loc.photos, loc.accessibility_features,
+    loc.reviews, loc.creator) must already be eagerly loaded before this
+    function is called. Use _location_query_options() on the query that
+    fetches the location(s).
     """
     features = [{
         'type':     f.feature_type,
@@ -169,8 +201,8 @@ def _save_base64_photos(photos_raw, location_id):
 
     Returns the number of photos successfully saved.
     """
-    from models import Photo      # ← fixed: was "from app import Photo, db"
-    from extensions import db     # ← fixed
+    from models import Photo
+    from extensions import db
 
     if isinstance(photos_raw, str):
         photos_raw = _safe_json_loads(photos_raw, default=[])
@@ -214,8 +246,8 @@ def _save_base64_photos(photos_raw, location_id):
 
 def _save_multipart_photos(files_list, location_id):
     """Save photo files from a multipart/form-data request."""
-    from models import Photo      # ← fixed: was "from app import Photo, db"
-    from extensions import db     # ← fixed
+    from models import Photo
+    from extensions import db
 
     saved = 0
     files_list = files_list[:MAX_PHOTOS_PER_LOCATION]
@@ -289,11 +321,8 @@ def api_signup():
         400: { error } on validation failure
         409: { error } on duplicate email/username
     """
-    from models import User       # ← fixed: was "from app import User, db, ADMIN_EMAILS"
-    from extensions import db     # ← fixed
-    # ADMIN_EMAILS lives in Config, accessed via current_app.config at request time.
-    # Never import it from app.py — app.py uses a factory pattern so there's no
-    # module-level ADMIN_EMAILS variable to import.
+    from models import User
+    from extensions import db
     ADMIN_EMAILS = current_app.config.get('ADMIN_EMAILS', [])
 
     data = request.get_json(silent=True)
@@ -368,7 +397,7 @@ def api_login():
         200: { access_token, refresh_token, user: {...} }
         401: { error } on invalid credentials
     """
-    from models import User       # ← fixed: was "from app import User"
+    from models import User
 
     data = request.get_json(silent=True)
     if not data:
@@ -419,8 +448,8 @@ def api_refresh():
         200: { access_token }
         404: { error } if the user has been deleted since the token was issued
     """
-    from models import User       # ← fixed: was "from app import User, db"
-    from extensions import db     # ← fixed
+    from models import User
+    from extensions import db
 
     user_id = _current_user_id()
     if user_id is None:
@@ -485,9 +514,9 @@ def api_get_locations():
     Returns:
         200: [ { ...location dict... } ]
     """
-    from models import Location   # ← fixed: was "from app import Location"
+    from models import Location, Review
 
-    query = Location.query
+    query = Location.query.options(*_location_query_options())
 
     category = request.args.get('category')
     if category:
@@ -512,7 +541,8 @@ def api_get_locations():
     locations = query.order_by(Location.created_at.desc()).all()
 
     # Post-filter by feature (requires joining or iterating — we iterate
-    # because the feature list per location is always tiny)
+    # because the feature list per location is always tiny, and it's
+    # already eagerly loaded so no extra queries fire here)
     feature_filter = request.args.get('feature')
     result = []
     for loc in locations:
@@ -531,10 +561,17 @@ def api_get_locations():
 @mobile_api.route('/locations/<int:location_id>', methods=['GET'])
 def api_get_location(location_id):
     """Get a single location by ID with full details."""
-    from models import Location   # ← fixed: was "from app import Location, db"
-    from extensions import db     # ← fixed
+    from models import Location, Review
+    from extensions import db
 
-    loc = db.session.get(Location, location_id)
+    # Use query().options() instead of session.get() so we can attach
+    # the eager-load options — session.get() does not support .options()
+    loc = (
+        db.session.query(Location)
+        .options(*_location_query_options())
+        .filter(Location.id == location_id)
+        .first()
+    )
     if not loc:
         abort(404)
 
@@ -564,8 +601,8 @@ def api_create_location():
         "photos_base64": [{"filename": "img.jpg", "data": "base64..."}]
     }
     """
-    from models import Location, AccessibilityFeature   # ← fixed: was "from app import ..."
-    from extensions import db                           # ← fixed
+    from models import Location, AccessibilityFeature
+    from extensions import db
 
     user = get_current_user()
     if not user:
@@ -659,8 +696,8 @@ def api_create_location():
 @jwt_required()
 def api_update_location(location_id):
     """Update an existing location (owner or admin only)."""
-    from models import Location, AccessibilityFeature   # ← fixed: was "from app import ..."
-    from extensions import db                           # ← fixed
+    from models import Location, AccessibilityFeature
+    from extensions import db
 
     user = get_current_user()
     if not user:
@@ -747,8 +784,8 @@ def api_delete_location(location_id):
     consistent (the row is gone, orphan files are a cleanup job, not a
     correctness issue).
     """
-    from models import Location   # ← fixed: was "from app import Location, db"
-    from extensions import db     # ← fixed
+    from models import Location
+    from extensions import db
 
     user = get_current_user()
     if not user:
@@ -802,8 +839,8 @@ def api_add_review(location_id):
         "comment": str (optional)
     }
     """
-    from models import Location, Review   # ← fixed: was "from app import Location, Review, db"
-    from extensions import db             # ← fixed
+    from models import Location, Review
+    from extensions import db
 
     user = get_current_user()
     if not user:
@@ -862,8 +899,8 @@ def api_delete_review(review_id):
     Delete a review. Owner can delete their own; admin can delete any
     but must provide a reason (which gets logged).
     """
-    from models import Review     # ← fixed: was "from app import Review, db"
-    from extensions import db     # ← fixed
+    from models import Review
+    from extensions import db
 
     user = get_current_user()
     if not user:
@@ -910,8 +947,8 @@ def api_report_location(location_id):
 
     Request JSON: { "reason": str (required), "description": str (optional) }
     """
-    from models import Location, Report   # already correct
-    from extensions import db             # already correct
+    from models import Location, Report
+    from extensions import db
 
     user = get_current_user()
     if not user:
@@ -951,89 +988,196 @@ def api_report_location(location_id):
 @mobile_api.route('/chatbot', methods=['POST'])
 def api_chatbot():
     """
-    Keyword-matching chatbot (Phase 2 replaces this with the LLM).
+    AI-powered accessibility assistant using Gemma 4 31B via OpenRouter.
+
+    Attempts an LLM call first. If the API key is missing or the call
+    fails for any reason, falls back to keyword matching so the endpoint
+    never returns an error to the app.
 
     Request JSON: { "message": str (required), "lang": "en" | "ar" }
     Returns:     { "response": str, "suggestions": [str, ...] }
     """
+    import requests as http_requests
+
     data = request.get_json(silent=True)
     if not data:
         return jsonify({'error': 'Request body required'}), 400
 
-    message = (data.get('message') or '').lower().strip()
-    lang = data.get('lang', 'en')
+    message = (data.get('message') or '').strip()
+    lang    = data.get('lang', 'en')
 
-    responses_en = {
+    if not message:
+        return jsonify({'error': 'Message is required'}), 400
+
+    api_key = current_app.config.get('OPENROUTER_API_KEY', '')
+
+    # ── LLM path ──────────────────────────────────────────────────────
+    if api_key:
+        system_prompt = """You are JOAccess Assistant, an AI helper for the JOAccess app —
+an accessibility mapping platform for Jordan that helps people with disabilities
+find accessible locations across the country.
+
+You know about these accessibility features: wheelchair ramps, accessible restrooms,
+braille signage, accessible parking, elevators, audio assistance, wide doorways,
+and automatic doors.
+
+Location categories available in the app: Restaurants & Cafes, Shopping Malls,
+Supermarkets, Healthcare, Educational, Government Buildings, Religious Places,
+Transportation, Tourist Attractions, Beauty & Wellness, Parks, Entertainment,
+Hotels, Banks & ATMs, Sports & Fitness.
+
+Always be helpful, concise, and empathetic. Respond in the same language the user
+writes in — Arabic if they write in Arabic, English otherwise. Keep responses
+under 150 words.
+
+At the end of every response include this line with exactly 3-4 suggestions:
+SUGGESTIONS: ["suggestion1", "suggestion2", "suggestion3"]
+
+Suggestions should be relevant follow-up actions or category names from the app."""
+
+        try:
+            resp = http_requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization":  f"Bearer {api_key}",
+                    "Content-Type":   "application/json",
+                    "HTTP-Referer":   "https://joaccess.com",
+                    "X-Title":        "JOAccess",
+                },
+                json={
+                    "model":       "google/gemma-4-31b-it",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": message},
+                    ],
+                    "max_tokens":  300,
+                    "temperature": 0.7,
+                },
+                timeout=20,
+            )
+
+            if resp.ok:
+                raw_content = resp.json()['choices'][0]['message']['content'].strip()
+
+                # Parse the SUGGESTIONS line out of the response
+                suggestions   = []
+                response_text = raw_content
+                if 'SUGGESTIONS:' in raw_content:
+                    parts         = raw_content.split('SUGGESTIONS:', 1)
+                    response_text = parts[0].strip()
+                    try:
+                        suggestions = json.loads(parts[1].strip())
+                        if not isinstance(suggestions, list):
+                            suggestions = []
+                    except (ValueError, TypeError):
+                        suggestions = []
+
+                # Fallback suggestions if model didn't include the line
+                if not suggestions:
+                    suggestions = (
+                        ['Restaurants & Cafes', 'Healthcare', 'Shopping Malls', 'Parks']
+                        if lang == 'en'
+                        else ['مطاعم ومقاهي', 'رعاية صحية', 'مراكز تسوق', 'حدائق']
+                    )
+
+                return jsonify({
+                    'response':    response_text,
+                    'suggestions': suggestions[:4],
+                }), 200
+
+            current_app.logger.warning(
+                'OpenRouter returned %s: %s', resp.status_code, resp.text[:300]
+            )
+
+        except Exception as e:
+            current_app.logger.warning('OpenRouter chatbot call failed: %s', e)
+        # Fall through to keyword fallback
+
+    # ── Keyword fallback (no key or LLM call failed) ───────────────────
+    msg_lower = message.lower()
+
+    keyword_responses_en = {
         'wheelchair': {
-            'response': 'I can help you find wheelchair-accessible locations! We have locations with wheelchair ramps, accessible entrances, and elevators. Would you like me to show you restaurants, malls, or other specific types of locations?',
-            'suggestions': ['Restaurants', 'Shopping Malls', 'Healthcare', 'Parks'],
+            'response': 'I can help you find wheelchair-accessible locations! We have locations with wheelchair ramps, accessible entrances, and elevators across Jordan.',
+            'suggestions': ['Restaurants & Cafes', 'Shopping Malls', 'Healthcare', 'Parks'],
         },
         'parking': {
-            'response': 'Looking for accessible parking? I can show you locations that have designated accessible parking spots. What type of place are you looking for?',
+            'response': 'Looking for accessible parking? I can show you locations with designated accessible parking spots.',
             'suggestions': ['Supermarkets', 'Shopping Malls', 'Government Buildings', 'Healthcare'],
         },
         'restroom': {
-            'response': 'I can help you find locations with accessible restrooms. These locations have properly equipped facilities for people with disabilities. What category interests you?',
+            'response': 'I can help you find locations with accessible restrooms properly equipped for people with disabilities.',
             'suggestions': ['Restaurants & Cafes', 'Shopping Malls', 'Tourist Attractions', 'Parks'],
         },
-        'visual': {
-            'response': 'For visual impairments, I recommend locations with braille signage and audio assistance. Would you like to see places in any specific category?',
+        'braille': {
+            'response': 'Looking for braille signage? I can show you locations with braille and audio assistance for visually impaired visitors.',
             'suggestions': ['Government Buildings', 'Healthcare', 'Educational', 'Transportation'],
         },
+        'elevator': {
+            'response': 'I can help you find locations with working elevators for multi-floor accessibility.',
+            'suggestions': ['Shopping Malls', 'Healthcare', 'Government Buildings', 'Hotels'],
+        },
         'restaurant': {
-            'response': 'Great choice! I can show you accessible restaurants and cafes in Jordan. Many have wheelchair access, accessible restrooms, and wide doorways. Would you like to see them on the map?',
-            'suggestions': ['Show on map', 'Filter by area', 'See reviews'],
+            'response': 'I can show you accessible restaurants and cafes in Jordan with wheelchair access, accessible restrooms, and wide doorways.',
+            'suggestions': ['Restaurants & Cafes', 'Shopping Malls', 'Healthcare', 'Parks'],
+        },
+        'hospital': {
+            'response': 'Looking for accessible healthcare? Jordan has many hospitals and clinics with full accessibility features.',
+            'suggestions': ['Healthcare', 'Government Buildings', 'Transportation', 'Parks'],
         },
         'help': {
-            'response': "I'm here to help you find accessible locations in Jordan! You can ask me about:\n• Wheelchair accessibility\n• Accessible parking\n• Restrooms\n• Braille signage\n• Audio assistance\n• Or any specific type of location",
-            'suggestions': ['Restaurants', 'Healthcare', 'Shopping', 'Transportation'],
+            'response': "I'm here to help you find accessible locations in Jordan! Ask me about wheelchair access, parking, restrooms, braille signage, audio assistance, or any type of location.",
+            'suggestions': ['Restaurants & Cafes', 'Healthcare', 'Shopping Malls', 'Transportation'],
         },
     }
 
-    responses_ar = {
+    keyword_responses_ar = {
         'كرسي': {
-            'response': 'يمكنني مساعدتك في إيجاد أماكن يمكن الوصول إليها بكرسي متحرك! لدينا أماكن مع منحدرات ومداخل ومصاعد. هل تريد أن أريك مطاعم أو مراكز تسوق أو أنواع أخرى من الأماكن؟',
+            'response': 'يمكنني مساعدتك في إيجاد أماكن يمكن الوصول إليها بكرسي متحرك! لدينا أماكن مع منحدرات ومداخل ومصاعد في جميع أنحاء الأردن.',
             'suggestions': ['مطاعم ومقاهي', 'مراكز تسوق', 'رعاية صحية', 'حدائق'],
         },
         'موقف': {
-            'response': 'تبحث عن مواقف سيارات مخصصة؟ يمكنني أن أريك أماكن بها مواقف مخصصة لذوي الإعاقة. ما نوع المكان الذي تبحث عنه؟',
+            'response': 'تبحث عن مواقف سيارات مخصصة؟ يمكنني أن أريك أماكن بها مواقف مخصصة لذوي الإعاقة.',
             'suggestions': ['سوبرماركت', 'مراكز تسوق', 'مباني حكومية', 'رعاية صحية'],
         },
         'دورة مياه': {
-            'response': 'يمكنني مساعدتك في إيجاد أماكن بها دورات مياه مجهزة. هذه الأماكن لديها مرافق مناسبة لذوي الإعاقة. أي فئة تهمك؟',
+            'response': 'يمكنني مساعدتك في إيجاد أماكن بها دورات مياه مجهزة لذوي الإعاقة.',
             'suggestions': ['مطاعم ومقاهي', 'مراكز تسوق', 'مناطق سياحية', 'حدائق'],
         },
-        'بصر': {
-            'response': 'بالنسبة للإعاقات البصرية، أنصح بأماكن بها لافتات بطريقة برايل ومساعدة صوتية. هل تريد رؤية أماكن في فئة معينة؟',
+        'برايل': {
+            'response': 'تبحث عن لافتات برايل؟ يمكنني إظهار الأماكن التي تحتوي على لافتات برايل ومساعدة صوتية.',
             'suggestions': ['مباني حكومية', 'رعاية صحية', 'تعليمية', 'مواصلات'],
         },
+        'مصعد': {
+            'response': 'يمكنني مساعدتك في إيجاد أماكن بها مصاعد تعمل بشكل جيد.',
+            'suggestions': ['مراكز تسوق', 'رعاية صحية', 'مباني حكومية', 'فنادق'],
+        },
         'مطعم': {
-            'response': 'اختيار رائع! يمكنني أن أريك مطاعم ومقاهي يمكن الوصول إليها في الأردن. كثير منها لديه منحدرات ودورات مياه مجهزة وأبواب واسعة. هل تريد رؤيتها على الخريطة؟',
-            'suggestions': ['عرض على الخريطة', 'تصفية حسب المنطقة', 'مشاهدة التقييمات'],
+            'response': 'يمكنني أن أريك مطاعم ومقاهي يمكن الوصول إليها في الأردن مع منحدرات ودورات مياه مجهزة.',
+            'suggestions': ['مطاعم ومقاهي', 'مراكز تسوق', 'رعاية صحية', 'حدائق'],
         },
         'مساعدة': {
-            'response': 'أنا هنا لمساعدتك في إيجاد أماكن يمكن الوصول إليها في الأردن! يمكنك أن تسألني عن:\n• إمكانية الوصول بكرسي متحرك\n• مواقف السيارات المخصصة\n• دورات المياه\n• لافتات برايل\n• المساعدة الصوتية\n• أو أي نوع محدد من الأماكن',
-            'suggestions': ['مطاعم', 'رعاية صحية', 'تسوق', 'مواصلات'],
+            'response': 'أنا هنا لمساعدتك في إيجاد أماكن يمكن الوصول إليها في الأردن! اسألني عن الكراسي المتحركة، المواقف، دورات المياه، أو أي نوع من الأماكن.',
+            'suggestions': ['مطاعم ومقاهي', 'رعاية صحية', 'مراكز تسوق', 'مواصلات'],
         },
     }
 
-    responses = responses_ar if lang == 'ar' else responses_en
+    responses = keyword_responses_ar if lang == 'ar' else keyword_responses_en
+    for key, val in responses.items():
+        if key in msg_lower:
+            return jsonify(val), 200
 
-    for key in responses.keys():
-        if key in message:
-            return jsonify(responses[key]), 200
+    # Final default
+    if lang == 'ar':
+        return jsonify({
+            'response': 'أنا هنا لمساعدتك في إيجاد أماكن يمكن الوصول إليها في الأردن. يمكنك أن تسألني عن الكراسي المتحركة، مواقف السيارات، دورات المياه، أو أي نوع من الأماكن.',
+            'suggestions': ['كرسي متحرك', 'مواقف مخصصة', 'مطاعم ومقاهي', 'رعاية صحية'],
+        }), 200
 
-    default_response = {
-        'en': {
-            'response': "I'm here to help you find accessible locations in Jordan. You can ask me about wheelchair accessibility, parking, restrooms, or specific types of locations like restaurants, malls, or healthcare facilities. How can I assist you?",
-            'suggestions': ['Wheelchair access', 'Accessible parking', 'Restaurants', 'Healthcare'],
-        },
-        'ar': {
-            'response': 'أنا هنا لمساعدتك في إيجاد أماكن يمكن الوصول إليها في الأردن. يمكنك أن تسألني عن إمكانية الوصول بكرسي متحرك، مواقف السيارات، دورات المياه، أو أنواع محددة من الأماكن مثل المطاعم أو المراكز الصحية. كيف يمكنني مساعدتك؟',
-            'suggestions': ['كرسي متحرك', 'مواقف مخصصة', 'مطاعم', 'رعاية صحية'],
-        },
-    }
-    return jsonify(default_response.get(lang, default_response['en'])), 200
+    return jsonify({
+        'response': "I'm here to help you find accessible locations in Jordan. Ask me about wheelchair access, parking, restrooms, or any type of place you're looking for.",
+        'suggestions': ['Wheelchair access', 'Accessible parking', 'Restaurants & Cafes', 'Healthcare'],
+    }), 200
 
 
 # ═════════════════════════════════════════════
@@ -1065,7 +1209,7 @@ def api_update_accessibility_settings():
         "colorBlindMode": "none" | "protanopia" | "deuteranopia" | "tritanopia"
     }
     """
-    from extensions import db     # ← fixed: was "from app import db"
+    from extensions import db
 
     user = get_current_user()
     if not user:
@@ -1098,16 +1242,19 @@ def api_update_accessibility_settings():
 @jwt_required()
 def api_my_locations():
     """Get all locations created by the current user."""
-    from models import Location   # ← fixed: was "from app import Location"
+    from models import Location, Review
 
     user = get_current_user()
     if not user:
         return jsonify({'error': 'Authentication required'}), 401
 
-    locations = (Location.query
-                 .filter_by(user_id=user.id)
-                 .order_by(Location.created_at.desc())
-                 .all())
+    locations = (
+        Location.query
+        .options(*_location_query_options())
+        .filter_by(user_id=user.id)
+        .order_by(Location.created_at.desc())
+        .all()
+    )
 
     # Use the same serializer the other endpoints use — guarantees field
     # parity between /locations and /my-locations.

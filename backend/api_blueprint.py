@@ -985,17 +985,132 @@ def api_report_location(location_id):
 #  CHATBOT ENDPOINT
 # ═════════════════════════════════════════════
 
+import math
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """
+    Return the great-circle distance in kilometres between two
+    (lat, lon) points using the Haversine formula.
+
+    This is pure math — no external libraries needed.
+    The formula works by treating the Earth as a sphere (radius ~6371 km),
+    projecting both points onto it, and computing the arc between them.
+    """
+    R = 6371.0  # Earth's mean radius in km
+    # Convert degrees → radians (math.radians multiplies by π/180)
+    φ1, φ2 = math.radians(lat1), math.radians(lat2)
+    Δφ = math.radians(lat2 - lat1)
+    Δλ = math.radians(lon2 - lon1)
+    # Core Haversine formula
+    a = math.sin(Δφ / 2) ** 2 + math.cos(φ1) * math.cos(φ2) * math.sin(Δλ / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _build_location_context(user_lat=None, user_lon=None, limit=30):
+    """
+    Query the database for locations and return a plain-text summary
+    string that the LLM can read to answer user questions.
+
+    Why pass it as text and not JSON?
+    Because the LLM is better at reasoning over natural-language
+    descriptions than over raw JSON blobs, and it keeps the token count
+    lower. Each location becomes one line the model can scan quickly.
+
+    Parameters:
+        user_lat / user_lon: float or None — if provided, each location
+            gets a distance label and results are sorted closest-first.
+            If None, results are sorted by average rating instead.
+        limit: how many locations to include. 30 is enough context
+            without blowing the 300-token response budget.
+
+    Returns:
+        A multi-line string, or a short "no data" notice.
+    """
+    from models import Location, Review
+
+    try:
+        locations = (
+            Location.query
+            .options(*_location_query_options())
+            .all()
+        )
+    except Exception:
+        return "No location data available at the moment."
+
+    if not locations:
+        return "There are currently no locations listed in the app."
+
+    rows = []
+    for loc in locations:
+        # ── Compute average rating ──────────────────────────────────
+        avg = (
+            round(sum(r.rating for r in loc.reviews) / len(loc.reviews), 1)
+            if loc.reviews else None
+        )
+        rating_str = f"{avg}⭐ ({len(loc.reviews)} reviews)" if avg else "no ratings yet"
+
+        # ── Compute distance if user position is known ──────────────
+        dist_str = ""
+        dist_km  = None
+        if user_lat is not None and user_lon is not None:
+            dist_km  = _haversine_km(user_lat, user_lon, loc.latitude, loc.longitude)
+            dist_str = f" | {dist_km:.1f} km away"
+
+        # ── Accessibility features (only the available ones) ────────
+        available_features = [
+            f.feature_type.replace('_', ' ')
+            for f in loc.accessibility_features
+            if f.available
+        ]
+        features_str = (
+            ', '.join(available_features)
+            if available_features
+            else 'no accessibility features listed'
+        )
+
+        rows.append({
+            'text': (
+                f"• {loc.name} ({loc.name_ar}) | {loc.category} | "
+                f"{loc.address or 'address not listed'} | "
+                f"Rating: {rating_str}{dist_str} | "
+                f"Verified: {'yes' if loc.is_verified else 'no'} | "
+                f"Features: {features_str}"
+            ),
+            'dist_km':  dist_km,
+            'avg':      avg or 0,
+        })
+
+    # Sort: by distance if available, otherwise by rating descending
+    if user_lat is not None:
+        rows.sort(key=lambda r: r['dist_km'] if r['dist_km'] is not None else 9999)
+    else:
+        rows.sort(key=lambda r: r['avg'], reverse=True)
+
+    top = rows[:limit]
+    return '\n'.join(r['text'] for r in top)
+
+
 @mobile_api.route('/chatbot', methods=['POST'])
 def api_chatbot():
     """
     AI-powered accessibility assistant using Gemma 4 31B via OpenRouter.
 
-    Attempts an LLM call first. If the API key is missing or the call
-    fails for any reason, falls back to keyword matching so the endpoint
-    never returns an error to the app.
+    The LLM receives a real snapshot of the database so it can answer
+    specific questions like "what's closest to me?" or "any wheelchair-
+    accessible restaurants?".
 
-    Request JSON: { "message": str (required), "lang": "en" | "ar" }
-    Returns:     { "response": str, "suggestions": [str, ...] }
+    Falls back to keyword matching if the API key is missing or the
+    LLM call fails for any reason.
+
+    Request JSON:
+    {
+        "message": str   (required),
+        "lang":    str   ("en" | "ar", default "en"),
+        "lat":     float (optional — user's GPS latitude),
+        "lng":     float (optional — user's GPS longitude)
+    }
+
+    Returns: { "response": str, "suggestions": [str, ...] }
     """
     import requests as http_requests
 
@@ -1009,49 +1124,72 @@ def api_chatbot():
     if not message:
         return jsonify({'error': 'Message is required'}), 400
 
+    # ── Parse optional GPS coordinates ────────────────────────────────
+    user_lat = user_lon = None
+    try:
+        if data.get('lat') is not None and data.get('lng') is not None:
+            user_lat = float(data['lat'])
+            user_lon = float(data['lng'])
+    except (TypeError, ValueError):
+        pass  # bad coords → treat as if not provided
+
     api_key = current_app.config.get('OPENROUTER_API_KEY', '')
 
-    # ── LLM path ──────────────────────────────────────────────────────
+    # ── LLM path ───────────────────────────────────────────────────────
     if api_key:
-        system_prompt = """You are JOAccess Assistant, an AI helper for the JOAccess app —
-an accessibility mapping platform for Jordan that helps people with disabilities
-find accessible locations across the country.
+        # Build the location context string from the live DB
+        location_context = _build_location_context(user_lat, user_lon)
 
-You know about these accessibility features: wheelchair ramps, accessible restrooms,
-braille signage, accessible parking, elevators, audio assistance, wide doorways,
-and automatic doors.
+        # Tell the model whether we have the user's position
+        position_note = (
+            f"The user's current GPS position is: lat={user_lat:.5f}, lon={user_lon:.5f}. "
+            "Distances shown in the location list are straight-line (as the crow flies)."
+            if user_lat is not None
+            else "The user has not shared their GPS location."
+        )
 
-Location categories available in the app: Restaurants & Cafes, Shopping Malls,
-Supermarkets, Healthcare, Educational, Government Buildings, Religious Places,
-Transportation, Tourist Attractions, Beauty & Wellness, Parks, Entertainment,
-Hotels, Banks & ATMs, Sports & Fitness.
+        system_prompt = f"""You are the JOAccess Assistant — a friendly, helpful guide built into the JOAccess app, which maps accessible locations across Jordan for people with disabilities.
 
-Always be helpful, concise, and empathetic. Respond in the same language the user
-writes in — Arabic if they write in Arabic, English otherwise. Keep responses
-under 150 words.
+Your personality: warm, concise, and direct. You answer naturally like a knowledgeable local friend, not like a customer-service bot. Never repeat the same boilerplate line twice in the same conversation. Never say "I'm here to help you find accessible locations" more than once per session.
 
-At the end of every response include this line with exactly 3-4 suggestions:
+{position_note}
+
+Here is the live list of locations currently in the app (sorted {"by distance, closest first" if user_lat is not None else "by average rating"}):
+
+{location_context}
+
+Rules you MUST follow:
+1. When a user asks about locations, ALWAYS reference specific places from the list above by name. Never give a vague "we have locations with X" response when real data exists.
+2. When recommending places, mention the name, category, distance (if available), rating, and which relevant accessibility features it has.
+3. If the user asks for the closest location, give the top 1–3 from the sorted list.
+4. If the user asks about a specific feature (e.g. wheelchair ramp), filter the list and only mention places that actually have it.
+5. If no locations match what they asked for, say so honestly — don't make things up.
+6. Keep responses under 160 words.
+7. Respond in Arabic if the user writes in Arabic, English otherwise.
+8. At the end of every response include EXACTLY this line with 3–4 follow-up suggestions:
 SUGGESTIONS: ["suggestion1", "suggestion2", "suggestion3"]
+   Suggestions should be natural follow-up questions or app category names relevant to what was just discussed.
 
-Suggestions should be relevant follow-up actions or category names from the app."""
+Accessibility features you know about: wheelchair ramp, accessible restroom, braille signage, accessible parking, elevator, audio assistance, wide doorways, automatic doors.
+Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthcare, Educational, Government Buildings, Religious Places, Transportation, Tourist Attractions, Beauty & Wellness, Parks, Entertainment, Hotels, Banks & ATMs, Sports & Fitness."""
 
         try:
             resp = http_requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={
-                    "Authorization":  f"Bearer {api_key}",
-                    "Content-Type":   "application/json",
-                    "HTTP-Referer":   "https://joaccess.com",
-                    "X-Title":        "JOAccess",
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type":  "application/json",
+                    "HTTP-Referer":  "https://joaccess.com",
+                    "X-Title":       "JOAccess",
                 },
                 json={
-                    "model":       "google/gemma-4-31b-it",
+                    "model":    "google/gemma-4-31b-it",
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user",   "content": message},
                     ],
-                    "max_tokens":  300,
-                    "temperature": 0.7,
+                    "max_tokens":  400,   # slightly higher — we're embedding data now
+                    "temperature": 0.65,  # a touch lower for factual accuracy
                 },
                 timeout=20,
             )
@@ -1059,9 +1197,9 @@ Suggestions should be relevant follow-up actions or category names from the app.
             if resp.ok:
                 raw_content = resp.json()['choices'][0]['message']['content'].strip()
 
-                # Parse the SUGGESTIONS line out of the response
                 suggestions   = []
                 response_text = raw_content
+
                 if 'SUGGESTIONS:' in raw_content:
                     parts         = raw_content.split('SUGGESTIONS:', 1)
                     response_text = parts[0].strip()
@@ -1072,7 +1210,6 @@ Suggestions should be relevant follow-up actions or category names from the app.
                     except (ValueError, TypeError):
                         suggestions = []
 
-                # Fallback suggestions if model didn't include the line
                 if not suggestions:
                     suggestions = (
                         ['Restaurants & Cafes', 'Healthcare', 'Shopping Malls', 'Parks']
@@ -1091,9 +1228,9 @@ Suggestions should be relevant follow-up actions or category names from the app.
 
         except Exception as e:
             current_app.logger.warning('OpenRouter chatbot call failed: %s', e)
-        # Fall through to keyword fallback
+        # Fall through to keyword fallback ↓
 
-    # ── Keyword fallback (no key or LLM call failed) ───────────────────
+    # ── Keyword fallback (unchanged) ───────────────────────────────────
     msg_lower = message.lower()
 
     keyword_responses_en = {
@@ -1167,7 +1304,6 @@ Suggestions should be relevant follow-up actions or category names from the app.
         if key in msg_lower:
             return jsonify(val), 200
 
-    # Final default
     if lang == 'ar':
         return jsonify({
             'response': 'أنا هنا لمساعدتك في إيجاد أماكن يمكن الوصول إليها في الأردن. يمكنك أن تسألني عن الكراسي المتحركة، مواقف السيارات، دورات المياه، أو أي نوع من الأماكن.',
@@ -1175,10 +1311,9 @@ Suggestions should be relevant follow-up actions or category names from the app.
         }), 200
 
     return jsonify({
-        'response': "I'm here to help you find accessible locations in Jordan. Ask me about wheelchair access, parking, restrooms, or any type of place you're looking for.",
+        'response': "Ask me about wheelchair access, parking, restrooms, or any type of place you're looking for across Jordan.",
         'suggestions': ['Wheelchair access', 'Accessible parking', 'Restaurants & Cafes', 'Healthcare'],
     }), 200
-
 
 # ═════════════════════════════════════════════
 #  ACCESSIBILITY SETTINGS

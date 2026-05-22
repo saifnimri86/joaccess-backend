@@ -1109,13 +1109,16 @@ def _build_location_context(user_lat=None, user_lon=None, limit=30):
 
 
 @mobile_api.route('/chatbot', methods=['POST'])
+@jwt_required()
 def api_chatbot():
     """
     AI-powered accessibility assistant using Gemma 4 31B via OpenRouter.
+    Requires a valid JWT — anonymous access is not permitted.
 
-    The LLM receives a real snapshot of the database so it can answer
-    specific questions like "what's closest to me?" or "any wheelchair-
-    accessible restaurants?".
+    The LLM receives a real snapshot of the database plus the current
+    user's name and disability context so it can personalise responses.
+    GPS coordinates are used silently for distance sorting and are never
+    exposed to the model or returned to the client.
 
     Falls back to keyword matching if the API key is missing or the
     LLM call fails for any reason.
@@ -1139,6 +1142,11 @@ def api_chatbot():
     """
     import requests as http_requests
 
+    # ── Auth ──────────────────────────────────────────────────────────
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Authentication required'}), 401
+
     data = request.get_json(silent=True)
     if not data:
         return jsonify({'error': 'Request body required'}), 400
@@ -1150,6 +1158,8 @@ def api_chatbot():
         return jsonify({'error': 'Message is required'}), 400
 
     # ── Parse optional GPS coordinates ────────────────────────────────
+    # Coordinates are used ONLY for distance calculations and sorting.
+    # They are never passed to the LLM or included in any response.
     user_lat = user_lon = None
     try:
         if data.get('lat') is not None and data.get('lng') is not None:
@@ -1157,6 +1167,16 @@ def api_chatbot():
             user_lon = float(data['lng'])
     except (TypeError, ValueError):
         pass  # bad coords → treat as if not provided
+
+    # ── Build user context for the prompt ─────────────────────────────
+    # We pass the user's name and disability as plain text so the model
+    # can personalise recommendations. If disability is null or empty we
+    # tell the model to ask the user what they need instead of assuming.
+    disability_context = (
+        f"The user has indicated the following about their disability or accessibility needs: {user.disability}"
+        if user.disability and user.disability.strip()
+        else "The user has not specified any disability or accessibility needs — ask them what kind of help or features they're looking for."
+    )
 
     api_key = current_app.config.get('OPENROUTER_API_KEY', '')
 
@@ -1166,34 +1186,41 @@ def api_chatbot():
             user_lat, user_lon
         )
 
-        position_note = (
-            f"The user's current GPS position is: lat={user_lat:.5f}, lon={user_lon:.5f}. "
-            "Distances shown in the location list are straight-line (as the crow flies)."
-            if user_lat is not None
-            else "The user has not shared their GPS location."
-        )
+        # Whether GPS was provided affects how locations are sorted and
+        # described, but the actual coordinates are never shown to the model.
+        has_location = user_lat is not None and user_lon is not None
 
         system_prompt = f"""You are the JOAccess Assistant — a friendly, helpful guide built into the JOAccess app, which maps accessible locations across Jordan for people with disabilities.
 
 Your personality: warm, concise, and direct. You answer naturally like a knowledgeable local friend, not like a customer-service bot. Never repeat the same boilerplate line twice in the same conversation. Never say "I'm here to help you find accessible locations" more than once per session.
 
-{position_note}
+CURRENT USER:
+- Name: {user.username}
+- {disability_context}
 
-Here is the live list of locations currently in the app (sorted {"by distance, closest first" if user_lat is not None else "by average rating"}):
+IMPORTANT PRIVACY RULES:
+- You do NOT know the user's GPS coordinates or exact location. Do not mention, repeat, or reference any coordinates or numbers related to their position.
+- You DO know the distance to each location (pre-calculated and shown in the list below) — you may reference distances naturally, e.g. "only 0.3 km away".
+- The only personal details you know about this user are their name and what's stated above about their disability. Do not claim to know anything else.
+- If the user asks what you know about them, tell them only their name and their disability/accessibility info as provided above — nothing more.
+
+Here is the live list of locations currently in the app (sorted {"by distance, closest first" if has_location else "by average rating"}):
 
 {location_context}
 
 Rules you MUST follow:
-1. When a user asks about locations, ALWAYS reference specific places from the list above by name. Never give a vague "we have locations with X" response when real data exists.
-2. When recommending places, mention the name, category, distance (if available), rating, and which relevant accessibility features it has.
-3. If the user asks for the closest location, give the top 1–3 from the sorted list.
-4. If the user asks about a specific feature (e.g. wheelchair ramp), filter the list and only mention places that actually have it.
-5. If no locations match what they asked for, say so honestly — don't make things up.
-6. Keep responses under 160 words.
-7. Respond in Arabic if the user writes in Arabic, English otherwise.
-8. At the end of every response include EXACTLY this line with 3–4 follow-up suggestions:
+1. Address the user by name ({user.username}) naturally — not in every message, just where it feels right.
+2. When a user asks about locations, ALWAYS reference specific places from the list above by name. Never give a vague "we have locations with X" response when real data exists.
+3. When recommending places, mention the name, category, distance (if available), rating, and which relevant accessibility features it has.
+4. If the user asks for the closest location, give the top 1–3 from the sorted list.
+5. If the user asks about a specific feature (e.g. wheelchair ramp), filter the list and only mention places that actually have it.
+6. Tailor your recommendations to the user's disability context when relevant — e.g. if they use a wheelchair, prioritise places with ramps and elevators without being asked.
+7. If no locations match what they asked for, say so honestly — don't make things up.
+8. Keep responses under 160 words.
+9. Respond in Arabic if the user writes in Arabic, English otherwise.
+10. At the end of every response include EXACTLY this line with 3–4 follow-up suggestions:
 SUGGESTIONS: ["suggestion1", "suggestion2", "suggestion3"]
-   Suggestions should be natural follow-up questions or app category names relevant to what was just discussed.
+    Suggestions should be natural follow-up questions or app category names relevant to what was just discussed.
 
 Accessibility features you know about: wheelchair ramp, accessible restroom, braille signage, accessible parking, elevator, audio assistance, wide doorways, automatic doors.
 Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthcare, Educational, Government Buildings, Religious Places, Transportation, Tourist Attractions, Beauty & Wellness, Parks, Entertainment, Hotels, Banks & ATMs, Sports & Fitness."""
@@ -1369,6 +1396,7 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
         'suggestions': ['Wheelchair access', 'Accessible parking', 'Restaurants & Cafes', 'Healthcare'],
         'locations':   [],
     }), 200
+    
     
 
 # ═════════════════════════════════════════════

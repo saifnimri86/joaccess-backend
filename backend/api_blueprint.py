@@ -1125,10 +1125,11 @@ def api_chatbot():
 
     Request JSON:
     {
-        "message": str   (required),
-        "lang":    str   ("en" | "ar", default "en"),
-        "lat":     float (optional — user's GPS latitude),
-        "lng":     float (optional — user's GPS longitude)
+        "message":          str   (required),
+        "lang":             str   ("en" | "ar", default "en"),
+        "lat":              float (optional — user's GPS latitude),
+        "lng":              float (optional — user's GPS longitude),
+        "location_enabled": bool  (optional — whether location permission is granted)
     }
 
     Returns:
@@ -1160,7 +1161,9 @@ def api_chatbot():
     # ── Parse optional GPS coordinates ────────────────────────────────
     # Coordinates are used ONLY for distance calculations and sorting.
     # They are never passed to the LLM or included in any response.
-    user_lat = user_lon = None
+    user_lat         = user_lon = None
+    location_enabled = bool(data.get('location_enabled', False))
+
     try:
         if data.get('lat') is not None and data.get('lng') is not None:
             user_lat = float(data['lat'])
@@ -1168,14 +1171,43 @@ def api_chatbot():
     except (TypeError, ValueError):
         pass  # bad coords → treat as if not provided
 
+    # ── Build location status for the prompt ──────────────────────────
+    # Three possible states:
+    #   1. Coords received       → distances available, use them silently
+    #   2. Enabled but no fix    → permission granted but GPS not ready yet
+    #   3. Disabled/denied       → tell user to enable permission if they ask
+    if user_lat is not None:
+        location_status = (
+            "The user has enabled location permissions and their position is known. "
+            "Distances to each location have been pre-calculated and are shown in the "
+            "location list below. You may reference distances naturally (e.g. 'only 0.3 km away') "
+            "but NEVER mention, repeat, or reference the raw coordinates themselves. "
+            "If the user asks where they are, infer their approximate area from the "
+            "closest location(s) in the list — e.g. 'You seem to be near Ar-Ramtha' — "
+            "but never state exact coordinates."
+        )
+    elif location_enabled:
+        location_status = (
+            "The user has enabled location permissions but a GPS fix has not been "
+            "obtained yet. Do not reference any distances or the user's position. "
+            "If they ask where they are or for the closest location, let them know "
+            "their position is still loading and to try again in a moment."
+        )
+    else:
+        location_status = (
+            "The user has NOT enabled location permissions for the JOAccess app. "
+            "If they ask anything that requires their location (closest place, distance, "
+            "where am I, etc.), tell them directly and clearly that you need location "
+            "access to answer that, and ask them to enable location permissions for "
+            "JOAccess in their device settings. Do not guess, approximate, or infer "
+            "their location under any circumstances."
+        )
+
     # ── Build user context for the prompt ─────────────────────────────
-    # We pass the user's name and disability as plain text so the model
-    # can personalise recommendations. If disability is null or empty we
-    # tell the model to ask the user what they need instead of assuming.
     disability_context = (
         f"The user has indicated the following about their disability or accessibility needs: {user.disability}"
         if user.disability and user.disability.strip()
-        else "The user has not specified any disability or accessibility needs — ask them what kind of help or features they're looking for."
+        else "The user has not specified any disability or accessibility needs — if relevant, ask them what kind of help or features they're looking for."
     )
 
     api_key = current_app.config.get('OPENROUTER_API_KEY', '')
@@ -1186,9 +1218,7 @@ def api_chatbot():
             user_lat, user_lon
         )
 
-        # Whether GPS was provided affects how locations are sorted and
-        # described, but the actual coordinates are never shown to the model.
-        has_location = user_lat is not None and user_lon is not None
+        has_location = user_lat is not None
 
         system_prompt = f"""You are the JOAccess Assistant — a friendly, helpful guide built into the JOAccess app, which maps accessible locations across Jordan for people with disabilities.
 
@@ -1198,11 +1228,14 @@ CURRENT USER:
 - Name: {user.username}
 - {disability_context}
 
+LOCATION ACCESS STATUS:
+{location_status}
+
 IMPORTANT PRIVACY RULES:
-- You do NOT know the user's GPS coordinates or exact location. Do not mention, repeat, or reference any coordinates or numbers related to their position.
-- You DO know the distance to each location (pre-calculated and shown in the list below) — you may reference distances naturally, e.g. "only 0.3 km away".
-- The only personal details you know about this user are their name and what's stated above about their disability. Do not claim to know anything else.
-- If the user asks what you know about them, tell them only their name and their disability/accessibility info as provided above — nothing more.
+- NEVER mention, reveal, or reference raw GPS coordinates (lat/lon numbers) under any circumstances.
+- NEVER claim to know anything about the user beyond what is stated in CURRENT USER above.
+- If the user asks "what do you know about me?", respond with ONLY their name and their disability/accessibility info as listed above — nothing else.
+- Distances you see in the location list are pre-calculated by the server. You may quote them naturally but never explain how they were computed.
 
 Here is the live list of locations currently in the app (sorted {"by distance, closest first" if has_location else "by average rating"}):
 
@@ -1396,7 +1429,6 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
         'suggestions': ['Wheelchair access', 'Accessible parking', 'Restaurants & Cafes', 'Healthcare'],
         'locations':   [],
     }), 200
-    
     
 
 # ═════════════════════════════════════════════

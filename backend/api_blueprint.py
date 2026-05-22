@@ -987,6 +987,7 @@ def api_report_location(location_id):
 
 import math
 
+
 def _haversine_km(lat1, lon1, lat2, lon2):
     """
     Return the great-circle distance in kilometres between two
@@ -996,37 +997,24 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     The formula works by treating the Earth as a sphere (radius ~6371 km),
     projecting both points onto it, and computing the arc between them.
     """
-    R = 6371.0  # Earth's mean radius in km
-    # Convert degrees → radians (math.radians multiplies by π/180)
+    R = 6371.0
     φ1, φ2 = math.radians(lat1), math.radians(lat2)
     Δφ = math.radians(lat2 - lat1)
     Δλ = math.radians(lon2 - lon1)
-    # Core Haversine formula
     a = math.sin(Δφ / 2) ** 2 + math.cos(φ1) * math.cos(φ2) * math.sin(Δλ / 2) ** 2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def _build_location_context(user_lat=None, user_lon=None, limit=30):
     """
-    Query the database for locations and return a plain-text summary
-    string that the LLM can read to answer user questions.
+    Query the database for locations and return a tuple of:
+        - text_context:  plain-text lines for the LLM system prompt
+        - structured:    list of location dicts for card rendering in the app
 
-    Why pass it as text and not JSON?
-    Because the LLM is better at reasoning over natural-language
-    descriptions than over raw JSON blobs, and it keeps the token count
-    lower. Each location becomes one line the model can scan quickly.
-
-    Parameters:
-        user_lat / user_lon: float or None — if provided, each location
-            gets a distance label and results are sorted closest-first.
-            If None, results are sorted by average rating instead.
-        limit: how many locations to include. 30 is enough context
-            without blowing the 300-token response budget.
-
-    Returns:
-        A multi-line string, or a short "no data" notice.
+    Sorted by distance (closest first) if GPS is provided,
+    otherwise sorted by average rating descending.
     """
-    from models import Location, Review
+    from models import Location
 
     try:
         locations = (
@@ -1035,28 +1023,28 @@ def _build_location_context(user_lat=None, user_lon=None, limit=30):
             .all()
         )
     except Exception:
-        return "No location data available at the moment."
+        return "No location data available at the moment.", []
 
     if not locations:
-        return "There are currently no locations listed in the app."
+        return "There are currently no locations listed in the app.", []
 
     rows = []
     for loc in locations:
-        # ── Compute average rating ──────────────────────────────────
+        # ── Average rating ──────────────────────────────────────────
         avg = (
             round(sum(r.rating for r in loc.reviews) / len(loc.reviews), 1)
             if loc.reviews else None
         )
         rating_str = f"{avg}⭐ ({len(loc.reviews)} reviews)" if avg else "no ratings yet"
 
-        # ── Compute distance if user position is known ──────────────
+        # ── Distance ────────────────────────────────────────────────
         dist_str = ""
         dist_km  = None
         if user_lat is not None and user_lon is not None:
             dist_km  = _haversine_km(user_lat, user_lon, loc.latitude, loc.longitude)
             dist_str = f" | {dist_km:.1f} km away"
 
-        # ── Accessibility features (only the available ones) ────────
+        # ── Accessibility features (available ones only) ────────────
         available_features = [
             f.feature_type.replace('_', ' ')
             for f in loc.accessibility_features
@@ -1076,18 +1064,48 @@ def _build_location_context(user_lat=None, user_lon=None, limit=30):
                 f"Verified: {'yes' if loc.is_verified else 'no'} | "
                 f"Features: {features_str}"
             ),
-            'dist_km':  dist_km,
-            'avg':      avg or 0,
+            'dist_km': dist_km,
+            'avg':     avg or 0,
+            'loc':     loc,
         })
 
-    # Sort: by distance if available, otherwise by rating descending
+    # Sort by distance if GPS available, otherwise by rating
     if user_lat is not None:
         rows.sort(key=lambda r: r['dist_km'] if r['dist_km'] is not None else 9999)
     else:
         rows.sort(key=lambda r: r['avg'], reverse=True)
 
     top = rows[:limit]
-    return '\n'.join(r['text'] for r in top)
+
+    # ── Plain-text block for the LLM ───────────────────────────────
+    text_context = '\n'.join(r['text'] for r in top)
+
+    # ── Structured list for card rendering ─────────────────────────
+    structured = []
+    for r in top:
+        loc = r['loc']
+        structured.append({
+            'id':           loc.id,
+            'name':         loc.name,
+            'name_ar':      loc.name_ar,
+            'category':     loc.category,
+            'address':      loc.address or '',
+            'address_ar':   loc.address_ar or '',
+            'latitude':     loc.latitude,
+            'longitude':    loc.longitude,
+            'avg_rating':   round(r['avg'], 1),
+            'review_count': len(loc.reviews),
+            'is_verified':  loc.is_verified,
+            'distance_km':  round(r['dist_km'], 2) if r['dist_km'] is not None else None,
+            'features':     [
+                f.feature_type
+                for f in loc.accessibility_features
+                if f.available
+            ],
+            'photo': loc.photos[0].filename if loc.photos else None,
+        })
+
+    return text_context, structured
 
 
 @mobile_api.route('/chatbot', methods=['POST'])
@@ -1110,7 +1128,14 @@ def api_chatbot():
         "lng":     float (optional — user's GPS longitude)
     }
 
-    Returns: { "response": str, "suggestions": [str, ...] }
+    Returns:
+    {
+        "response":    str,
+        "suggestions": [str, ...],
+        "locations":   [ { id, name, name_ar, category, address, address_ar,
+                           latitude, longitude, avg_rating, review_count,
+                           is_verified, distance_km, features, photo } ]
+    }
     """
     import requests as http_requests
 
@@ -1137,10 +1162,10 @@ def api_chatbot():
 
     # ── LLM path ───────────────────────────────────────────────────────
     if api_key:
-        # Build the location context string from the live DB
-        location_context = _build_location_context(user_lat, user_lon)
+        location_context, all_locations_structured = _build_location_context(
+            user_lat, user_lon
+        )
 
-        # Tell the model whether we have the user's position
         position_note = (
             f"The user's current GPS position is: lat={user_lat:.5f}, lon={user_lon:.5f}. "
             "Distances shown in the location list are straight-line (as the crow flies)."
@@ -1169,6 +1194,9 @@ Rules you MUST follow:
 8. At the end of every response include EXACTLY this line with 3–4 follow-up suggestions:
 SUGGESTIONS: ["suggestion1", "suggestion2", "suggestion3"]
    Suggestions should be natural follow-up questions or app category names relevant to what was just discussed.
+9. After the SUGGESTIONS line, add a LOCATIONS line listing the English names of every specific location you mentioned in your response, exactly as they appear in the list above, comma-separated:
+LOCATIONS: Location Name One, Location Name Two
+   If you mentioned no specific locations, write: LOCATIONS: none
 
 Accessibility features you know about: wheelchair ramp, accessible restroom, braille signage, accessible parking, elevator, audio assistance, wide doorways, automatic doors.
 Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthcare, Educational, Government Buildings, Religious Places, Transportation, Tourist Attractions, Beauty & Wellness, Parks, Entertainment, Hotels, Banks & ATMs, Sports & Fitness."""
@@ -1188,8 +1216,8 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
                         {"role": "system", "content": system_prompt},
                         {"role": "user",   "content": message},
                     ],
-                    "max_tokens":  400,   # slightly higher — we're embedding data now
-                    "temperature": 0.65,  # a touch lower for factual accuracy
+                    "max_tokens":  400,
+                    "temperature": 0.65,
                 },
                 timeout=20,
             )
@@ -1197,18 +1225,33 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
             if resp.ok:
                 raw_content = resp.json()['choices'][0]['message']['content'].strip()
 
-                suggestions   = []
-                response_text = raw_content
+                suggestions      = []
+                mentioned_names  = []
+                response_text    = raw_content
 
+                # ── Parse LOCATIONS line (must come before SUGGESTIONS
+                #    since it appears after it in the raw output) ──────
+                if 'LOCATIONS:' in raw_content:
+                    parts        = raw_content.split('LOCATIONS:', 1)
+                    raw_content  = parts[0].strip()
+                    names_raw    = parts[1].strip().split('\n')[0]
+                    if names_raw.lower() != 'none':
+                        mentioned_names = [
+                            n.strip() for n in names_raw.split(',') if n.strip()
+                        ]
+
+                # ── Parse SUGGESTIONS line ───────────────────────────
                 if 'SUGGESTIONS:' in raw_content:
                     parts         = raw_content.split('SUGGESTIONS:', 1)
                     response_text = parts[0].strip()
                     try:
-                        suggestions = json.loads(parts[1].strip())
+                        suggestions = json.loads(parts[1].strip().split('\n')[0])
                         if not isinstance(suggestions, list):
                             suggestions = []
                     except (ValueError, TypeError):
                         suggestions = []
+                else:
+                    response_text = raw_content
 
                 if not suggestions:
                     suggestions = (
@@ -1217,9 +1260,20 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
                         else ['مطاعم ومقاهي', 'رعاية صحية', 'مراكز تسوق', 'حدائق']
                     )
 
+                # ── Filter structured locations to only mentioned ones ─
+                if mentioned_names:
+                    mentioned_lower     = [n.lower() for n in mentioned_names]
+                    locations_for_cards = [
+                        loc for loc in all_locations_structured
+                        if loc['name'].lower() in mentioned_lower
+                    ]
+                else:
+                    locations_for_cards = []
+
                 return jsonify({
                     'response':    response_text,
                     'suggestions': suggestions[:4],
+                    'locations':   locations_for_cards,
                 }), 200
 
             current_app.logger.warning(
@@ -1230,72 +1284,87 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
             current_app.logger.warning('OpenRouter chatbot call failed: %s', e)
         # Fall through to keyword fallback ↓
 
-    # ── Keyword fallback (unchanged) ───────────────────────────────────
+    # ── Keyword fallback (no API key or LLM call failed) ──────────────
     msg_lower = message.lower()
 
     keyword_responses_en = {
         'wheelchair': {
-            'response': 'I can help you find wheelchair-accessible locations! We have locations with wheelchair ramps, accessible entrances, and elevators across Jordan.',
+            'response':    'I can help you find wheelchair-accessible locations! We have locations with wheelchair ramps, accessible entrances, and elevators across Jordan.',
             'suggestions': ['Restaurants & Cafes', 'Shopping Malls', 'Healthcare', 'Parks'],
+            'locations':   [],
         },
         'parking': {
-            'response': 'Looking for accessible parking? I can show you locations with designated accessible parking spots.',
+            'response':    'Looking for accessible parking? I can show you locations with designated accessible parking spots.',
             'suggestions': ['Supermarkets', 'Shopping Malls', 'Government Buildings', 'Healthcare'],
+            'locations':   [],
         },
         'restroom': {
-            'response': 'I can help you find locations with accessible restrooms properly equipped for people with disabilities.',
+            'response':    'I can help you find locations with accessible restrooms properly equipped for people with disabilities.',
             'suggestions': ['Restaurants & Cafes', 'Shopping Malls', 'Tourist Attractions', 'Parks'],
+            'locations':   [],
         },
         'braille': {
-            'response': 'Looking for braille signage? I can show you locations with braille and audio assistance for visually impaired visitors.',
+            'response':    'Looking for braille signage? I can show you locations with braille and audio assistance for visually impaired visitors.',
             'suggestions': ['Government Buildings', 'Healthcare', 'Educational', 'Transportation'],
+            'locations':   [],
         },
         'elevator': {
-            'response': 'I can help you find locations with working elevators for multi-floor accessibility.',
+            'response':    'I can help you find locations with working elevators for multi-floor accessibility.',
             'suggestions': ['Shopping Malls', 'Healthcare', 'Government Buildings', 'Hotels'],
+            'locations':   [],
         },
         'restaurant': {
-            'response': 'I can show you accessible restaurants and cafes in Jordan with wheelchair access, accessible restrooms, and wide doorways.',
+            'response':    'I can show you accessible restaurants and cafes in Jordan with wheelchair access, accessible restrooms, and wide doorways.',
             'suggestions': ['Restaurants & Cafes', 'Shopping Malls', 'Healthcare', 'Parks'],
+            'locations':   [],
         },
         'hospital': {
-            'response': 'Looking for accessible healthcare? Jordan has many hospitals and clinics with full accessibility features.',
+            'response':    'Looking for accessible healthcare? Jordan has many hospitals and clinics with full accessibility features.',
             'suggestions': ['Healthcare', 'Government Buildings', 'Transportation', 'Parks'],
+            'locations':   [],
         },
         'help': {
-            'response': "I'm here to help you find accessible locations in Jordan! Ask me about wheelchair access, parking, restrooms, braille signage, audio assistance, or any type of location.",
+            'response':    "I'm here to help you find accessible locations in Jordan! Ask me about wheelchair access, parking, restrooms, braille signage, audio assistance, or any type of location.",
             'suggestions': ['Restaurants & Cafes', 'Healthcare', 'Shopping Malls', 'Transportation'],
+            'locations':   [],
         },
     }
 
     keyword_responses_ar = {
         'كرسي': {
-            'response': 'يمكنني مساعدتك في إيجاد أماكن يمكن الوصول إليها بكرسي متحرك! لدينا أماكن مع منحدرات ومداخل ومصاعد في جميع أنحاء الأردن.',
+            'response':    'يمكنني مساعدتك في إيجاد أماكن يمكن الوصول إليها بكرسي متحرك! لدينا أماكن مع منحدرات ومداخل ومصاعد في جميع أنحاء الأردن.',
             'suggestions': ['مطاعم ومقاهي', 'مراكز تسوق', 'رعاية صحية', 'حدائق'],
+            'locations':   [],
         },
         'موقف': {
-            'response': 'تبحث عن مواقف سيارات مخصصة؟ يمكنني أن أريك أماكن بها مواقف مخصصة لذوي الإعاقة.',
+            'response':    'تبحث عن مواقف سيارات مخصصة؟ يمكنني أن أريك أماكن بها مواقف مخصصة لذوي الإعاقة.',
             'suggestions': ['سوبرماركت', 'مراكز تسوق', 'مباني حكومية', 'رعاية صحية'],
+            'locations':   [],
         },
         'دورة مياه': {
-            'response': 'يمكنني مساعدتك في إيجاد أماكن بها دورات مياه مجهزة لذوي الإعاقة.',
+            'response':    'يمكنني مساعدتك في إيجاد أماكن بها دورات مياه مجهزة لذوي الإعاقة.',
             'suggestions': ['مطاعم ومقاهي', 'مراكز تسوق', 'مناطق سياحية', 'حدائق'],
+            'locations':   [],
         },
         'برايل': {
-            'response': 'تبحث عن لافتات برايل؟ يمكنني إظهار الأماكن التي تحتوي على لافتات برايل ومساعدة صوتية.',
+            'response':    'تبحث عن لافتات برايل؟ يمكنني إظهار الأماكن التي تحتوي على لافتات برايل ومساعدة صوتية.',
             'suggestions': ['مباني حكومية', 'رعاية صحية', 'تعليمية', 'مواصلات'],
+            'locations':   [],
         },
         'مصعد': {
-            'response': 'يمكنني مساعدتك في إيجاد أماكن بها مصاعد تعمل بشكل جيد.',
+            'response':    'يمكنني مساعدتك في إيجاد أماكن بها مصاعد تعمل بشكل جيد.',
             'suggestions': ['مراكز تسوق', 'رعاية صحية', 'مباني حكومية', 'فنادق'],
+            'locations':   [],
         },
         'مطعم': {
-            'response': 'يمكنني أن أريك مطاعم ومقاهي يمكن الوصول إليها في الأردن مع منحدرات ودورات مياه مجهزة.',
+            'response':    'يمكنني أن أريك مطاعم ومقاهي يمكن الوصول إليها في الأردن مع منحدرات ودورات مياه مجهزة.',
             'suggestions': ['مطاعم ومقاهي', 'مراكز تسوق', 'رعاية صحية', 'حدائق'],
+            'locations':   [],
         },
         'مساعدة': {
-            'response': 'أنا هنا لمساعدتك في إيجاد أماكن يمكن الوصول إليها في الأردن! اسألني عن الكراسي المتحركة، المواقف، دورات المياه، أو أي نوع من الأماكن.',
+            'response':    'أنا هنا لمساعدتك في إيجاد أماكن يمكن الوصول إليها في الأردن! اسألني عن الكراسي المتحركة، المواقف، دورات المياه، أو أي نوع من الأماكن.',
             'suggestions': ['مطاعم ومقاهي', 'رعاية صحية', 'مراكز تسوق', 'مواصلات'],
+            'locations':   [],
         },
     }
 
@@ -1306,14 +1375,17 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
 
     if lang == 'ar':
         return jsonify({
-            'response': 'أنا هنا لمساعدتك في إيجاد أماكن يمكن الوصول إليها في الأردن. يمكنك أن تسألني عن الكراسي المتحركة، مواقف السيارات، دورات المياه، أو أي نوع من الأماكن.',
+            'response':    'أنا هنا لمساعدتك في إيجاد أماكن يمكن الوصول إليها في الأردن. يمكنك أن تسألني عن الكراسي المتحركة، مواقف السيارات، دورات المياه، أو أي نوع من الأماكن.',
             'suggestions': ['كرسي متحرك', 'مواقف مخصصة', 'مطاعم ومقاهي', 'رعاية صحية'],
+            'locations':   [],
         }), 200
 
     return jsonify({
-        'response': "Ask me about wheelchair access, parking, restrooms, or any type of place you're looking for across Jordan.",
+        'response':    "Ask me about wheelchair access, parking, restrooms, or any type of place you're looking for across Jordan.",
         'suggestions': ['Wheelchair access', 'Accessible parking', 'Restaurants & Cafes', 'Healthcare'],
+        'locations':   [],
     }), 200
+
 
 # ═════════════════════════════════════════════
 #  ACCESSIBILITY SETTINGS

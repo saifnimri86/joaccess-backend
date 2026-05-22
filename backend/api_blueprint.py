@@ -1194,9 +1194,6 @@ Rules you MUST follow:
 8. At the end of every response include EXACTLY this line with 3–4 follow-up suggestions:
 SUGGESTIONS: ["suggestion1", "suggestion2", "suggestion3"]
    Suggestions should be natural follow-up questions or app category names relevant to what was just discussed.
-9. After the SUGGESTIONS line, add a LOCATIONS line listing the English names of every specific location you mentioned in your response, exactly as they appear in the list above, comma-separated:
-LOCATIONS: Location Name One, Location Name Two
-   If you mentioned no specific locations, write: LOCATIONS: none
 
 Accessibility features you know about: wheelchair ramp, accessible restroom, braille signage, accessible parking, elevator, audio assistance, wide doorways, automatic doors.
 Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthcare, Educational, Government Buildings, Religious Places, Transportation, Tourist Attractions, Beauty & Wellness, Parks, Entertainment, Hotels, Banks & ATMs, Sports & Fitness."""
@@ -1225,20 +1222,8 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
             if resp.ok:
                 raw_content = resp.json()['choices'][0]['message']['content'].strip()
 
-                suggestions      = []
-                mentioned_names  = []
-                response_text    = raw_content
-
-                # ── Parse LOCATIONS line (must come before SUGGESTIONS
-                #    since it appears after it in the raw output) ──────
-                if 'LOCATIONS:' in raw_content:
-                    parts        = raw_content.split('LOCATIONS:', 1)
-                    raw_content  = parts[0].strip()
-                    names_raw    = parts[1].strip().split('\n')[0]
-                    if names_raw.lower() != 'none':
-                        mentioned_names = [
-                            n.strip() for n in names_raw.split(',') if n.strip()
-                        ]
+                suggestions   = []
+                response_text = raw_content
 
                 # ── Parse SUGGESTIONS line ───────────────────────────
                 if 'SUGGESTIONS:' in raw_content:
@@ -1250,8 +1235,6 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
                             suggestions = []
                     except (ValueError, TypeError):
                         suggestions = []
-                else:
-                    response_text = raw_content
 
                 if not suggestions:
                     suggestions = (
@@ -1260,15 +1243,16 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
                         else ['مطاعم ومقاهي', 'رعاية صحية', 'مراكز تسوق', 'حدائق']
                     )
 
-                # ── Filter structured locations to only mentioned ones ─
-                if mentioned_names:
-                    mentioned_lower     = [n.lower() for n in mentioned_names]
-                    locations_for_cards = [
-                        loc for loc in all_locations_structured
-                        if loc['name'].lower() in mentioned_lower
-                    ]
-                else:
-                    locations_for_cards = []
+                # ── Match locations by scanning the response text ─────
+                # We don't rely on the model to output a LOCATIONS line
+                # because smaller models like Gemma skip it unpredictably.
+                # Instead we check whether each location's English name
+                # appears anywhere in the response text — much more reliable.
+                response_lower      = response_text.lower()
+                locations_for_cards = [
+                    loc for loc in all_locations_structured
+                    if loc['name'].lower() in response_lower
+                ]
 
                 return jsonify({
                     'response':    response_text,
@@ -1385,7 +1369,7 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
         'suggestions': ['Wheelchair access', 'Accessible parking', 'Restaurants & Cafes', 'Healthcare'],
         'locations':   [],
     }), 200
-
+    
 
 # ═════════════════════════════════════════════
 #  ACCESSIBILITY SETTINGS

@@ -1006,17 +1006,41 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def _name_in_text(name, text):
+def _fuzzy_name_match(name, text, min_matches=3):
     """
-    Return True if `name` appears in `text` as a meaningful mention.
+    Return True if enough distinctive words from `name` appear in `text`.
 
-    Works for both Latin and Arabic scripts. re.escape handles any
-    special characters that might appear in location names.
+    Why fuzzy instead of exact?
+    The model often paraphrases location names slightly — different
+    spelling, dropped words, missing address suffixes — so exact
+    substring matching misses valid mentions. Instead we split both
+    the name and the response into words and count how many name-words
+    appear in the response. If enough match, we treat it as a mention.
+
+    Works for both Arabic and English scripts.
+
+    Parameters:
+        name:        the location's name or name_ar from the DB
+        text:        the model's response text
+        min_matches: minimum number of words that must match.
+                     Defaults to 3 — enough to avoid false positives
+                     from common short words while handling paraphrasing.
+                     If the name has fewer than min_matches words, ALL
+                     words must match instead.
     """
     if not name or not text:
         return False
-    pattern = re.compile(re.escape(name.lower()), re.IGNORECASE)
-    return bool(pattern.search(text.lower()))
+    name_lower = name.lower()
+    text_lower = text.lower()
+    # Split on whitespace, Arabic comma, Latin comma, and periods.
+    # Filter out very short words (≤2 chars) like "في", "of", "the"
+    # which are too common to be meaningful match signals.
+    words = [w for w in re.split(r'[\s،,\.]+', name_lower) if len(w) > 2]
+    if not words:
+        return False
+    matches  = sum(1 for w in words if w in text_lower)
+    required = min(min_matches, len(words))
+    return matches >= required
 
 
 def _build_location_context(user_lat=None, user_lon=None, limit=30):
@@ -1322,14 +1346,15 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
                     )
 
                 # ── Match locations by scanning the response text ─────
-                # Check both English and Arabic names since the model
-                # writes location names in whichever language it responds in.
-                # _name_in_text does a case-insensitive regex search so
-                # partial substring collisions are handled cleanly.
+                # Uses fuzzy word-overlap matching instead of exact
+                # substring matching because the model often paraphrases
+                # location names slightly. Checks both English (name) and
+                # Arabic (name_ar) since the model responds in the user's
+                # language and writes names accordingly.
                 locations_for_cards = [
                     loc for loc in all_locations_structured
-                    if _name_in_text(loc['name'], response_text)
-                    or _name_in_text(loc['name_ar'], response_text)
+                    if _fuzzy_name_match(loc['name'], response_text)
+                    or _fuzzy_name_match(loc['name_ar'], response_text)
                 ]
 
                 return jsonify({

@@ -986,6 +986,7 @@ def api_report_location(location_id):
 # ═════════════════════════════════════════════
 
 import math
+import re
 
 
 def _haversine_km(lat1, lon1, lat2, lon2):
@@ -1003,6 +1004,19 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     Δλ = math.radians(lon2 - lon1)
     a = math.sin(Δφ / 2) ** 2 + math.cos(φ1) * math.cos(φ2) * math.sin(Δλ / 2) ** 2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _name_in_text(name, text):
+    """
+    Return True if `name` appears in `text` as a meaningful mention.
+
+    Works for both Latin and Arabic scripts. re.escape handles any
+    special characters that might appear in location names.
+    """
+    if not name or not text:
+        return False
+    pattern = re.compile(re.escape(name.lower()), re.IGNORECASE)
+    return bool(pattern.search(text.lower()))
 
 
 def _build_location_context(user_lat=None, user_lon=None, limit=30):
@@ -1254,6 +1268,7 @@ Rules you MUST follow:
 10. At the end of every response include EXACTLY this line with 3–4 follow-up suggestions:
 SUGGESTIONS: ["suggestion1", "suggestion2", "suggestion3"]
     Suggestions should be natural follow-up questions or app category names relevant to what was just discussed.
+11. Only mention a location by name if you are actively recommending it as a direct answer to what the user asked. Do not name locations as passing side-suggestions unless they genuinely match the request.
 
 Accessibility features you know about: wheelchair ramp, accessible restroom, braille signage, accessible parking, elevator, audio assistance, wide doorways, automatic doors.
 Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthcare, Educational, Government Buildings, Religious Places, Transportation, Tourist Attractions, Beauty & Wellness, Parks, Entertainment, Hotels, Banks & ATMs, Sports & Fitness."""
@@ -1304,14 +1319,14 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
                     )
 
                 # ── Match locations by scanning the response text ─────
-                # We don't rely on the model to output a LOCATIONS line
-                # because smaller models like Gemma skip it unpredictably.
-                # Instead we check whether each location's English name
-                # appears anywhere in the response text — much more reliable.
-                response_lower      = response_text.lower()
+                # Check both English and Arabic names since the model
+                # writes location names in whichever language it responds in.
+                # _name_in_text does a case-insensitive regex search so
+                # partial substring collisions are handled cleanly.
                 locations_for_cards = [
                     loc for loc in all_locations_structured
-                    if loc['name'].lower() in response_lower
+                    if _name_in_text(loc['name'], response_text)
+                    or _name_in_text(loc['name_ar'], response_text)
                 ]
 
                 return jsonify({
@@ -1429,7 +1444,7 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
         'suggestions': ['Wheelchair access', 'Accessible parking', 'Restaurants & Cafes', 'Healthcare'],
         'locations':   [],
     }), 200
-    
+
 
 # ═════════════════════════════════════════════
 #  ACCESSIBILITY SETTINGS

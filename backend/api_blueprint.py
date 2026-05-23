@@ -1196,9 +1196,12 @@ def api_chatbot():
             "Distances to each location have been pre-calculated and are shown in the "
             "location list below. You may reference distances naturally (e.g. 'only 0.3 km away') "
             "but NEVER mention, repeat, or reference the raw coordinates themselves. "
-            "If the user asks where they are, infer their approximate area from the "
-            "closest location(s) in the list — e.g. 'You seem to be near Ar-Ramtha' — "
-            "but never state exact coordinates."
+            "If the user asks where they are, look at the FIRST location in the list "
+            "(which is the closest one) and infer the user's area from its address field only. "
+            "For example if the closest location's address contains 'Irbid', say 'You seem to be near Irbid'. "
+            "Do NOT use your own knowledge of Jordan's geography to guess. "
+            "Do NOT mention any city or area that does not appear in the closest location's address. "
+            "Never state exact coordinates."
         )
     elif location_enabled:
         location_status = (

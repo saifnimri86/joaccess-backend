@@ -796,6 +796,11 @@ def api_update_location(location_id):
                         available=True,
                     ))
 
+
+        # Remove photos the user marked for deletion (DB + file). Done before
+        # appending so removals and additions in the same request don't fight
+        # over the per-location cap.
+        _remove_photos(data.get('removed_photos', []), location.id)
         # Append new photos (existing ones preserved)
         _save_base64_photos(data.get('photos_base64', []), location.id)
 

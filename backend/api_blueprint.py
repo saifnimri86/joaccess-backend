@@ -243,6 +243,46 @@ def _save_base64_photos(photos_raw, location_id):
 
     return saved
 
+def _remove_photos(removed_raw, location_id):
+    """
+    Hard-delete photos belonging to `location_id` by filename.
+    Deletes the Photo rows first (DB is authoritative — if the file unlink
+    fails, the row is still gone and the orphan file is a cleanup job, not
+    a correctness issue). Filenames are filtered by location_id so a caller
+    can't ask us to delete another location's photo.
+    Returns the number of rows deleted.
+    """
+    from models import Photo
+    from extensions import db
+    if isinstance(removed_raw, str):
+        removed_raw = _safe_json_loads(removed_raw, default=[])
+    if not isinstance(removed_raw, list):
+        return 0
+    filenames = [f for f in removed_raw if isinstance(f, str) and f]
+    if not filenames:
+        return 0
+    rows = Photo.query.filter(
+        Photo.location_id == location_id,
+        Photo.filename.in_(filenames),
+    ).all()
+    if not rows:
+        return 0
+    confirmed = [r.filename for r in rows]
+    for row in rows:
+        db.session.delete(row)
+    db.session.flush()
+    upload_folder = current_app.config['UPLOAD_FOLDER']
+    for filename in confirmed:
+        filepath = os.path.join(upload_folder, filename)
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except OSError as e:
+            current_app.logger.warning(
+                'Failed to delete photo file %s: %s', filename, e
+            )
+    return len(confirmed)
+
 
 def _save_multipart_photos(files_list, location_id):
     """Save photo files from a multipart/form-data request."""
@@ -670,7 +710,11 @@ def api_create_location():
         # Photo uploads (multipart)
         if request.files:
             _save_multipart_photos(request.files.getlist('photos'), location.id)
-
+            
+        # Remove photos the user marked for deletion (DB + file). Done before
+        # appending so removals and additions in the same request don't fight
+        # over the per-location cap.
+        _remove_photos(data.get('removed_photos', []), location.id)
         # Photo uploads (base64 from JSON)
         _save_base64_photos(data.get('photos_base64', []), location.id)
 

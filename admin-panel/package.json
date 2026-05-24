@@ -25,7 +25,9 @@
     "recharts": "^2.13.0"
   },
   "devDependencies": {
+    "@netlify/plugin-nextjs": "^5.15.11",
     "@tailwindcss/postcss": "^4.0.0-beta.4",
+    "@types/html-to-pdfmake": "^2.4.5",
     "@types/node": "^22",
     "@types/react": "^19",
     "@types/react-dom": "^19",

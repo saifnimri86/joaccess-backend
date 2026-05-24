@@ -1,0 +1,9 @@
+# admin-panel/netlify.toml
+
+[build]
+  base    = "admin-panel"
+  command = "npm run build"
+  publish = ".next"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"

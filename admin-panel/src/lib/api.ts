@@ -6,7 +6,18 @@
  * Every request that needs auth picks it up from there.
  */
 
-const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000";
+// ─── Backend selector ────────────────────────────────────────────────────────
+
+const BACKENDS = {
+  production: process.env.NEXT_PUBLIC_API_URL_PRODUCTION ?? "https://joaccess-backend.onrender.com",
+  staging:    process.env.NEXT_PUBLIC_API_URL_STAGING    ?? "https://joaccess-staging.onrender.com",
+  local:      "http://localhost:5000",
+} as const;
+
+type BackendEnv = keyof typeof BACKENDS;
+
+const activeEnv = (process.env.NEXT_PUBLIC_API_ENV ?? "production") as BackendEnv;
+const BASE = BACKENDS[activeEnv] ?? BACKENDS.production;
 
 // ─── Token helpers ──────────────────────────────────────────────────────────
 

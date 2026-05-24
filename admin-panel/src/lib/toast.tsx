@@ -114,7 +114,10 @@ export function ToastContainer() {
             className={`toast toast-${t.kind} pointer-events-auto ${t.leaving ? "leaving" : ""}`}
             role={t.kind === "error" ? "alert" : "status"}
           >
-            <Icon size={15} style={{ color: ICON_COLORS[t.kind] }} />
+          <span style={{ color: ICON_COLORS[t.kind], display: "flex" }}>
+            <Icon size={15} />
+          </span>
+          
             <span className="flex-1">{t.message}</span>
             <button
               onClick={() => dismiss(t.id)}

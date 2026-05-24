@@ -8,16 +8,31 @@
 
 // ─── Backend selector ────────────────────────────────────────────────────────
 
-const BACKENDS = {
+export const BACKENDS = {
   production: process.env.NEXT_PUBLIC_API_URL_PRODUCTION ?? "https://joaccess-backend.onrender.com",
   staging:    process.env.NEXT_PUBLIC_API_URL_STAGING    ?? "https://joaccess-staging.onrender.com",
   local:      "http://localhost:5000",
 } as const;
 
-type BackendEnv = keyof typeof BACKENDS;
+export type BackendEnv = keyof typeof BACKENDS;
 
-const activeEnv = (process.env.NEXT_PUBLIC_API_ENV ?? "production") as BackendEnv;
-const BASE = BACKENDS[activeEnv] ?? BACKENDS.production;
+const BACKEND_ENV_KEY = "joaccess_backend_env";
+const DEFAULT_ENV = (process.env.NEXT_PUBLIC_API_ENV ?? "production") as BackendEnv;
+
+export function getBackendEnv(): BackendEnv {
+  if (typeof window === "undefined") return DEFAULT_ENV;
+  const stored = localStorage.getItem(BACKEND_ENV_KEY) as BackendEnv | null;
+  return stored && stored in BACKENDS ? stored : DEFAULT_ENV;
+}
+
+export function setBackendEnv(env: BackendEnv): void {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(BACKEND_ENV_KEY, env);
+}
+
+function getBase(): string {
+  return BACKENDS[getBackendEnv()] ?? BACKENDS.production;
+}
 
 // ─── Token helpers ──────────────────────────────────────────────────────────
 
@@ -51,7 +66,7 @@ async function apiFetch<T>(
     if (token) headers["Authorization"] = `Bearer ${token}`;
   }
 
-  const res = await fetch(`${BASE}${path}`, { ...options, headers });
+  const res = await fetch(`${getBase()}${path}`, { ...options, headers });
 
   if (res.status === 401 || res.status === 403) {
     clearToken();
@@ -324,5 +339,5 @@ export function photoUrl(filename: string): string {
     return filename;
   }
   // Legacy fallback: locally-served upload via the Flask static route.
-  return `${BASE}/api/v1/uploads/${filename}`;
+  return `${getBase()}/api/v1/uploads/${filename}`;
 }

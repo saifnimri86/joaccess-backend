@@ -8,6 +8,7 @@ import { Loader2, Sun, Moon, Globe, Menu, X } from "lucide-react";
 import { useTheme } from "@/contexts/ThemeContext";
 import { useLanguage } from "@/contexts/LanguageContext";
 import { Logo } from "@/components/ui/Logo";
+import { BackendSwitcher } from "@/components/ui/BackendSwitcher";
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
@@ -106,6 +107,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
           {/* Controls */}
           <div className="flex items-center gap-2">
+            <BackendSwitcher />
             <button onClick={toggleLang} className="toggle-pill" title="Toggle language">
               <Globe size={13} />
               <span>{lang === "en" ? "عر" : "EN"}</span>

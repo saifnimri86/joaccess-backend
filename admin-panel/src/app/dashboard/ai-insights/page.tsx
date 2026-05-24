@@ -10,6 +10,8 @@ import {
 import { useLanguage } from "@/contexts/LanguageContext";
 import { toast } from "@/lib/toast";
 import ReactMarkdown from "react-markdown";
+import pdfMake from "pdfmake/build/pdfmake";
+import type { TDocumentDefinitions } from "pdfmake/interfaces";
 
 export default function AIInsightsPage() {
   const { t } = useLanguage();
@@ -40,57 +42,57 @@ export default function AIInsightsPage() {
   }
 
   const handleExportPDF = async () => {
-    try {
-      // Import PDF generation libraries dynamically
-      const pdfMakeModule = await import("pdfmake/build/pdfmake");
-      const pdfMake = pdfMakeModule.default ? pdfMakeModule.default : pdfMakeModule;
-      const pdfFontsModule = await import("pdfmake/build/vfs_fonts");
-      const pdfFonts = pdfFontsModule.default ? pdfFontsModule.default : pdfFontsModule;
-      const htmlToPdfmakeModule = await import("html-to-pdfmake");
-      const htmlToPdfmake = htmlToPdfmakeModule.default ? htmlToPdfmakeModule.default : (htmlToPdfmakeModule as any);
+  try {
+    const pdfFontsModule = await import("pdfmake/build/vfs_fonts");
+    const pdfFonts = (pdfFontsModule.default ?? pdfFontsModule) as any;
+    const htmlToPdfmakeModule = await import("html-to-pdfmake");
+    const htmlToPdfmake = (htmlToPdfmakeModule.default ?? htmlToPdfmakeModule) as any;
 
-      if (pdfFonts && pdfFonts.pdfMake) {
-        pdfMake.vfs = pdfFonts.pdfMake.vfs;
-      }
-
-      const element = document.getElementById("pdf-report-content");
-      if (!element) return;
-      
-      const htmlString = element.innerHTML;
-      const parsedHtml = htmlToPdfmake(htmlString, {
-        defaultStyles: {
-          h1: { fontSize: 20, bold: true, margin: [0, 8, 0, 4] },
-          h2: { fontSize: 18, bold: true, margin: [0, 8, 0, 4] },
-          h3: { fontSize: 14, bold: true, margin: [0, 8, 0, 4] },
-          p: { margin: [0, 4, 0, 4], color: 'black' },
-          ul: { margin: [0, 4, 0, 4], color: 'black' },
-          ol: { margin: [0, 4, 0, 4], color: 'black' },
-          li: { color: 'black' },
-          strong: { bold: true, color: 'black' }
-        }
-      });
-
-      const documentDefinition = {
-        content: [
-          { text: 'JOAccess AI Analysis', style: 'header' },
-          { text: `Generated on ${new Date(result?.generated_at ?? "").toLocaleString()}`, style: 'subheader' },
-          ...parsedHtml
-        ],
-        styles: {
-          header: { fontSize: 24, bold: true, margin: [0, 0, 0, 5] as any, alignment: 'center' as const },
-          subheader: { fontSize: 12, color: 'gray', margin: [0, 0, 0, 20] as any, alignment: 'center' as const }
-        },
-        defaultStyle: {
-          color: 'black'
-        }
-      };
-
-      pdfMake.createPdf(documentDefinition).download('joaccess-ai-insights.pdf');
-    } catch (err) {
-      console.error("PDF Export failed", err);
-      toast.error("Failed to export PDF");
+    if (pdfFonts?.pdfMake?.vfs) {
+      (pdfMake as any).vfs = pdfFonts.pdfMake.vfs;
     }
-  };
+
+    const element = document.getElementById("pdf-report-content");
+    if (!element) return;
+
+    const htmlString = element.innerHTML;
+    const parsedHtml = htmlToPdfmake(htmlString, {
+      defaultStyles: {
+        h1: { fontSize: 20, bold: true, margin: [0, 8, 0, 4] },
+        h2: { fontSize: 18, bold: true, margin: [0, 8, 0, 4] },
+        h3: { fontSize: 14, bold: true, margin: [0, 8, 0, 4] },
+        p: { margin: [0, 4, 0, 4], color: "black" },
+        ul: { margin: [0, 4, 0, 4], color: "black" },
+        ol: { margin: [0, 4, 0, 4], color: "black" },
+        li: { color: "black" },
+        strong: { bold: true, color: "black" },
+      },
+    });
+
+    const documentDefinition: TDocumentDefinitions = {
+      content: [
+        { text: "JOAccess AI Analysis", style: "header" },
+        {
+          text: `Generated on ${new Date(result?.generated_at ?? "").toLocaleString()}`,
+          style: "subheader",
+        },
+        ...parsedHtml,
+      ],
+      styles: {
+        header: { fontSize: 24, bold: true, margin: [0, 0, 0, 5], alignment: "center" },
+        subheader: { fontSize: 12, color: "gray", margin: [0, 0, 0, 20], alignment: "center" },
+      },
+      defaultStyle: {
+        color: "black",
+      },
+    };
+
+    pdfMake.createPdf(documentDefinition).download("joaccess-ai-insights.pdf");
+  } catch (err) {
+    console.error("PDF Export failed", err);
+    toast.error("Failed to export PDF");
+  }
+};
 
   return (
     <div className="space-y-6 max-w-3xl mx-auto flex flex-col items-center w-full">

@@ -1,25 +1,8 @@
-"""
-admin_blueprint.py
-==================
-Standalone Flask Blueprint for the JOAccess Admin Panel (Next.js).
-
-Register in app.py by adding these lines after jwt.init_app(app):
-
-    from admin_blueprint import admin_api
-    app.register_blueprint(admin_api, url_prefix='/api/admin')
-
-All routes require a valid JWT where the 'is_admin' claim is True.
-Tokens are issued by /api/admin/login — NOT by /api/v1/auth/login.
-
-Environment variables needed:
-    GOOGLE_AI_API_KEY   — Gemma 4 via Google AI Studio (for AI insights)
-"""
-
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import (
     create_access_token, jwt_required, get_jwt, get_jwt_identity,
 )
-from sqlalchemy import func, select, or_, desc
+from sqlalchemy import func, select, or_, desc, asc
 from datetime import datetime, timedelta
 from functools import wraps
 import json
@@ -28,8 +11,6 @@ import requests as http_requests
 
 admin_api = Blueprint("admin_api", __name__)
 
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _get_db_models():
     from extensions import db
@@ -61,15 +42,13 @@ def _escape_like(s):
 
 
 def _paginate_select(db, stmt, page, per_page):
-    """Paginate a SQLAlchemy 2.0 select() statement. Returns (items, total, pages)."""
+    """paginate a 2.0 select(). returns (items, total, pages)."""
     count_stmt = select(func.count()).select_from(stmt.subquery())
     total = db.session.execute(count_stmt).scalar() or 0
     items = db.session.execute(stmt.offset((page - 1) * per_page).limit(per_page)).scalars().all()
     pages = max(1, (total + per_page - 1) // per_page)
     return items, total, pages
 
-
-# ── AUTH ─────────────────────────────────────────────────────────────────────
 
 @admin_api.route("/login", methods=["POST"])
 def admin_login():
@@ -125,8 +104,6 @@ def admin_me():
         "review_count": len(user.reviews),
     }), 200
 
-
-# ── DASHBOARD STATS ───────────────────────────────────────────────────────────
 
 @admin_api.route("/stats", methods=["GET"])
 @admin_jwt_required
@@ -245,8 +222,6 @@ def admin_stats():
     }), 200
 
 
-# ── LOCATIONS ─────────────────────────────────────────────────────────────────
-
 @admin_api.route("/locations", methods=["GET"])
 @admin_jwt_required
 def admin_get_locations():
@@ -349,26 +324,64 @@ def admin_delete_location(location_id):
     return jsonify({"success": True}), 200
 
 
-# ── USERS ─────────────────────────────────────────────────────────────────────
-
 @admin_api.route("/users", methods=["GET"])
 @admin_jwt_required
 def admin_get_users():
-    db, User, *_ = _get_db_models()
+    db, User, Location, Review, *_ = _get_db_models()
 
     page     = max(1, int(request.args.get("page", 1)))
     per_page = min(50, max(1, int(request.args.get("per_page", 15))))
     search   = request.args.get("search", "").strip()
+    user_type  = request.args.get("user_type", "").strip().lower()
+    sort_by    = request.args.get("sort_by", "").strip().lower()
+    sort_order = request.args.get("sort_order", "desc").strip().lower()
 
-    stmt = select(User)
+    direction = asc if sort_order == "asc" else desc
+
+    # correlated subqueries so the counts can be both returned and sorted on
+    location_count_sq = (
+        select(func.count(Location.id))
+        .where(Location.user_id == User.id)
+        .correlate(User)
+        .scalar_subquery()
+    )
+    review_count_sq = (
+        select(func.count(Review.id))
+        .where(Review.user_id == User.id)
+        .correlate(User)
+        .scalar_subquery()
+    )
+
+    stmt = select(
+        User,
+        location_count_sq.label("location_count"),
+        review_count_sq.label("review_count"),
+    )
+
     if search:
         p = f"%{_escape_like(search)}%"
         stmt = stmt.where(or_(
             User.username.ilike(p, escape="\\"),
             User.email.ilike(p, escape="\\"),
         ))
-    stmt = stmt.order_by(desc(User.created_at))
-    users, total, pages = _paginate_select(db, stmt, page, per_page)
+
+    if user_type in ("individual", "organization"):
+        stmt = stmt.where(User.user_type == user_type)
+
+    if sort_by == "reviews":
+        stmt = stmt.order_by(direction(review_count_sq), desc(User.created_at))
+    elif sort_by == "locations":
+        stmt = stmt.order_by(direction(location_count_sq), desc(User.created_at))
+    else:
+        stmt = stmt.order_by(desc(User.created_at))
+
+    # can't reuse _paginate_select — stmt returns (User, int, int) tuples
+    count_stmt = select(func.count()).select_from(stmt.subquery())
+    total = db.session.execute(count_stmt).scalar() or 0
+    rows = db.session.execute(
+        stmt.offset((page - 1) * per_page).limit(per_page)
+    ).all()
+    pages = max(1, (total + per_page - 1) // per_page)
 
     return jsonify({
         "users": [
@@ -377,10 +390,10 @@ def admin_get_users():
                 "user_type": u.user_type, "org_name": u.org_name,
                 "disability": u.disability, "is_admin": u.is_admin,
                 "created_at": u.created_at.isoformat() if u.created_at else None,
-                "location_count": len(u.locations),
-                "review_count": len(u.reviews),
+                "location_count": int(loc_count or 0),
+                "review_count": int(rev_count or 0),
             }
-            for u in users
+            for (u, loc_count, rev_count) in rows
         ],
         "total": total, "pages": pages, "page": page,
     }), 200
@@ -399,8 +412,6 @@ def admin_delete_user(user_id):
     db.session.commit()
     return jsonify({"success": True}), 200
 
-
-# ── REVIEWS ───────────────────────────────────────────────────────────────────
 
 @admin_api.route("/reviews", methods=["GET"])
 @admin_jwt_required
@@ -440,8 +451,6 @@ def admin_delete_review(review_id):
     return jsonify({"success": True}), 200
 
 
-# ── REPORTS ───────────────────────────────────────────────────────────────────
-
 @admin_api.route("/reports", methods=["GET"])
 @admin_jwt_required
 def admin_get_reports():
@@ -462,7 +471,6 @@ def admin_get_reports():
                 "reporter_id": r.user_id, "reason": r.reason,
                 "description": r.description,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
-                # Real resolution tracking — was previously a "[RESOLVED] " string prefix hack.
                 "resolved": r.resolved_at is not None,
                 "resolved_at": r.resolved_at.isoformat() if r.resolved_at else None,
                 "resolved_by": r.resolved_by,
@@ -480,8 +488,7 @@ def admin_resolve_report(report_id):
     report = db.session.get(Report, report_id)
     if not report:
         return jsonify({"error": "Report not found"}), 404
-    # Only stamp the first time so re-POSTs are idempotent and we don't
-    # overwrite who originally resolved it.
+    # idempotent — only stamp the first resolver
     if report.resolved_at is None:
         report.resolved_at = datetime.utcnow()
         report.resolved_by = _current_user_id()
@@ -501,15 +508,11 @@ def admin_delete_report(report_id):
     return jsonify({"success": True}), 200
 
 
-# ── AI INSIGHTS ───────────────────────────────────────────────────────────────
-
 @admin_api.route("/ai-insights", methods=["POST"])
 @admin_jwt_required
 def admin_ai_insights():
     db, User, Location, Review, Report, _ = _get_db_models()
 
-    # Read from app config (populated from env via config.py), not os.environ
-    # directly — keeps all env-var reads in one place.
     api_key = current_app.config.get("OPENROUTER_API_KEY")
     if not api_key:
         return jsonify({"error": "OPENROUTER_API_KEY is not set on the server."}), 503
@@ -554,7 +557,6 @@ JOAccess Platform Statistics:
 
     url = "https://openrouter.ai/api/v1/chat/completions"
     payload = {
-        # Gemma 4 on OpenRouter — free tier, no rate-limit surprises.
         "model": "google/gemma-4-31b-it",
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -566,7 +568,6 @@ JOAccess Platform Statistics:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        # OpenRouter recommends sending these so they can track usage by app.
         "HTTP-Referer": "https://joaccess-admin.netlify.app",
         "X-Title": "JOAccess Admin Panel",
     }

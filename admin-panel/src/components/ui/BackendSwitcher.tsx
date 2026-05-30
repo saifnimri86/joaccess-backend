@@ -12,7 +12,7 @@ export function BackendSwitcher() {
   }, []);
 
   if (!env) {
-    // Avoid SSR/CSR mismatch — render nothing until hydrated
+    // avoid ssr/csr mismatch
     return null;
   }
 
@@ -23,7 +23,7 @@ export function BackendSwitcher() {
 
   function toggle() {
     setBackendEnv(next);
-    // Full reload so all in-flight queries / cached state refetch against the new BASE.
+    // full reload so cached queries refetch against the new base
     window.location.reload();
   }
 

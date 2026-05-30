@@ -34,12 +34,10 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       });
   }, [router]);
 
-  // Close drawer on route change (parent re-renders with new children)
   useEffect(() => {
     setDrawerOpen(false);
   }, [children]);
 
-  // ESC closes drawer
   useEffect(() => {
     if (!drawerOpen) return;
     const onKey = (e: KeyboardEvent) => {
@@ -59,12 +57,10 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
   return (
     <div className="flex min-h-screen">
-      {/* Desktop sidebar */}
       <div className="hidden lg:block sticky top-0 h-screen">
         <Sidebar />
       </div>
 
-      {/* Mobile drawer */}
       {drawerOpen && (
         <>
           <div className="drawer-backdrop lg:hidden" onClick={() => setDrawerOpen(false)} />
@@ -78,12 +74,10 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       )}
 
       <main className="flex-1 flex flex-col min-w-0">
-        {/* Top bar */}
         <header
           className="h-14 px-4 lg:px-6 flex items-center justify-between shrink-0 sticky top-0 z-30"
           style={{ background: "var(--c-surface)", borderBottom: "1px solid var(--c-border)" }}
         >
-          {/* Mobile: hamburger + logo; Desktop: spacer */}
           <div className="flex items-center gap-3">
             <button
               onClick={() => setDrawerOpen(true)}
@@ -105,7 +99,6 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             </div>
           </div>
 
-          {/* Controls */}
           <div className="flex items-center gap-2">
             <BackendSwitcher />
             <button onClick={toggleLang} className="toggle-pill" title="Toggle language">
@@ -118,7 +111,6 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
             <div className="w-px h-5 mx-1 hidden sm:block" style={{ background: "var(--c-border)" }} />
 
-            {/* User — hidden on very small screens */}
             <div className="hidden sm:flex items-center gap-2.5">
               <div className="text-end">
                 <p className="text-xs font-semibold leading-none" style={{ color: "var(--c-ink)" }}>
@@ -140,7 +132,6 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
               </div>
             </div>
 
-            {/* Close-drawer helper on mobile when open (unused visually but keeps React happy) */}
             <span className="hidden">{drawerOpen ? <X size={0} /> : null}</span>
           </div>
         </header>

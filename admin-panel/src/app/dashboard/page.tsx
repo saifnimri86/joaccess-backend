@@ -15,7 +15,6 @@ import {
 import { useLanguage } from "@/contexts/LanguageContext";
 import { useTheme } from "@/contexts/ThemeContext";
 
-// Maroon-leaning palette — no more out-of-theme blues/purples
 const CATEGORY_COLORS = [
   "#800000","#9A1C1C","#B33838","#D97070","#F4E3E3",
   "#4A0000","#600000","#D4A045","#6B8E4E","#5F4E2B","#8B5A2B","#A0522D",
@@ -57,7 +56,6 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-6 max-w-screen-xl">
-      {/* Header */}
       <div className="animate-fade-up">
         <h1 className="font-display text-2xl font-bold tracking-tight" style={{ color: "var(--c-ink)" }}>
           {t("dash_title")}
@@ -67,7 +65,6 @@ export default function DashboardPage() {
         </p>
       </div>
 
-      {/* Stat cards */}
       <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3">
         {isLoading ? (
           Array.from({ length: 6 }).map((_, i) => <StatCardSkeleton key={i} />)
@@ -83,7 +80,6 @@ export default function DashboardPage() {
         )}
       </div>
 
-      {/* Secondary stats */}
       {data && (
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 animate-fade-up delay-200">
           <div className="card p-5 flex items-center gap-4">
@@ -120,7 +116,6 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* Charts row 1 */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 animate-fade-up delay-300">
         <div className="card p-5">
           <div className="flex items-center gap-2 mb-4">
@@ -169,7 +164,6 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* Charts row 2 */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 animate-fade-up delay-400">
         <div className="card p-5">
           <h3 className="section-title mb-4">{t("dash_categories")}</h3>
@@ -208,7 +202,6 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* Top + Recent */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 animate-fade-up delay-500">
         <div className="card overflow-hidden">
           <div className="px-5 py-4" style={{ borderBottom: "1px solid var(--c-border)" }}>

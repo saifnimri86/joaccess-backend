@@ -9,21 +9,19 @@ import type { Location } from "@/lib/api";
 const JORDAN_CENTER: [number, number] = [31.18, 36.8];
 const JORDAN_ZOOM = 7;
 
-// Hard bounds — user cannot pan outside Jordan
+// hard bounds — user cannot pan outside jordan
 const JORDAN_BOUNDS: LatLngBoundsExpression = [
-  [29.0, 34.8],   // SW
-  [33.4, 39.4],   // NE
+  [29.0, 34.8],
+  [33.4, 39.4],
 ];
 
 function FitBounds({ locations, isFiltered }: { locations: Location[]; isFiltered: boolean }) {
   const map = useMap();
   useEffect(() => {
-    // Default view — show all of Jordan
     if (!isFiltered || locations.length === 0) {
       map.fitBounds(JORDAN_BOUNDS, { animate: true });
       return;
     }
-    // Filtered — zoom to matching pins
     const latlngs = locations
       .filter((l) => l.latitude != null && l.longitude != null)
       .map((l) => [l.latitude, l.longitude] as [number, number]);

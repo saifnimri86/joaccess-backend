@@ -23,7 +23,6 @@ export function ConfirmModal({
 
   useEffect(() => setMounted(true), []);
 
-  // ESC to close + lock body scroll while open
   useEffect(() => {
     if (!open) return;
     const prev = document.body.style.overflow;

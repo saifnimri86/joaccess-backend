@@ -17,30 +17,18 @@ mobile_api = Blueprint('mobile_api', __name__)
 jwt = JWTManager()
 bcrypt = Bcrypt()
 
-# ─────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────
 VALID_FEATURES = [
     'wheelchair_ramp', 'accessible_restroom', 'braille_signage',
     'accessible_parking', 'elevator', 'audio_assistance',
     'wide_doorways', 'automatic_doors'
 ]
 
-MAX_PHOTO_BYTES = 5 * 1024 * 1024           # 5MB per photo
-MAX_PHOTOS_PER_LOCATION = 10                # cap per request
+MAX_PHOTO_BYTES = 5 * 1024 * 1024
+MAX_PHOTOS_PER_LOCATION = 10
 
 
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
 def _current_user_id():
-    """
-    Return the current user's id as an int.
-
-    flask-jwt-extended 4.6+ requires the identity claim to be a string.
-    We store ids as strings in the token and convert back here so
-    SQLAlchemy lookups (which expect ints for integer PKs) still work.
-    """
+    # flask-jwt-extended 4.6+ requires identity claim to be a string
     raw = get_jwt_identity()
     if raw is None:
         return None
@@ -51,7 +39,6 @@ def _current_user_id():
 
 
 def get_current_user():
-    """Retrieve the User object for the currently authenticated JWT identity."""
     from models import User
     from extensions import db
     user_id = _current_user_id()
@@ -61,12 +48,6 @@ def get_current_user():
 
 
 def _safe_json_loads(value, default=None):
-    """
-    json.loads() that never raises. Returns `default` on any error.
-
-    Used for JSON columns in the DB (accessibility_settings) and for
-    JSON strings embedded in form-data request bodies.
-    """
     if value is None or value == '':
         return default
     try:
@@ -76,20 +57,12 @@ def _safe_json_loads(value, default=None):
 
 
 def _escape_like(s):
-    """
-    Escape SQL LIKE wildcards (%, _, backslash) so user input is treated
-    as a literal substring instead of a pattern.
-    """
     if not s:
         return ''
     return s.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
 
 
 def _generate_unique_filename(original):
-    """
-    Produce a filesystem-safe filename that won't collide with concurrent
-    uploads. Format: YYYYMMDD_HHMMSS_<8hexchars>_<sanitized>.ext
-    """
     safe = secure_filename(original) or 'upload.bin'
     stamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
     token = uuid.uuid4().hex[:8]
@@ -97,7 +70,6 @@ def _generate_unique_filename(original):
 
 
 def admin_required_api(fn):
-    """Decorator that requires both a valid JWT and admin privileges."""
     @wraps(fn)
     @jwt_required()
     def wrapper(*args, **kwargs):
@@ -109,22 +81,8 @@ def admin_required_api(fn):
 
 
 def _location_query_options():
-    """
-    Eagerly load every relationship that _serialize_location touches.
-
-    Without this, each attribute access (loc.photos, loc.reviews, etc.)
-    fires a separate lazy-load SQL query per location — the classic N+1
-    problem. Under a slow or strict Supabase staging connection this
-    causes Gunicorn workers to time out and crash with SIGKILL.
-
-    selectinload issues one extra query per relationship for the whole
-    result set (e.g. "SELECT * FROM photos WHERE location_id IN (1,2,3)")
-    instead of one query per row, which is dramatically more efficient.
-
-    We also chain .selectinload(Review.author) so that accessing
-    r.author inside _serialize_location doesn't fire yet another round
-    of lazy loads for every review.
-    """
+    # eager-load everything _serialize_location touches to avoid n+1
+    # queries that time out gunicorn workers on slow supabase staging
     from models import Location, Review
     return [
         selectinload(Location.photos),
@@ -135,16 +93,7 @@ def _location_query_options():
 
 
 def _serialize_location(loc, include_reviews=True):
-    """
-    Consistent dict representation of a Location for API responses.
-    Centralized here so /locations, /locations/:id, /my-locations all
-    return the same field set.
-
-    IMPORTANT: all relationships (loc.photos, loc.accessibility_features,
-    loc.reviews, loc.creator) must already be eagerly loaded before this
-    function is called. Use _location_query_options() on the query that
-    fetches the location(s).
-    """
+    # caller must have eager-loaded relationships via _location_query_options
     features = [{
         'type':     f.feature_type,
         'available': f.available,
@@ -193,14 +142,6 @@ def _serialize_location(loc, include_reviews=True):
 
 
 def _save_base64_photos(photos_raw, location_id):
-    """
-    Save base64-encoded photos from a request payload.
-
-    Enforces size and count caps. Accepts either a list of dicts or a
-    JSON string (coming in via multipart/form-data).
-
-    Returns the number of photos successfully saved.
-    """
     from models import Photo
     from extensions import db
 
@@ -209,7 +150,6 @@ def _save_base64_photos(photos_raw, location_id):
     if not isinstance(photos_raw, list):
         return 0
 
-    # Enforce a hard cap regardless of what the client sends
     photos_raw = photos_raw[:MAX_PHOTOS_PER_LOCATION]
 
     saved = 0
@@ -222,10 +162,10 @@ def _save_base64_photos(photos_raw, location_id):
         try:
             img_bytes = base64.b64decode(photo_data['data'])
         except (ValueError, TypeError):
-            continue  # bad base64, skip silently
+            continue
 
         if len(img_bytes) > MAX_PHOTO_BYTES:
-            continue  # skip oversized
+            continue
 
         filename = _generate_unique_filename(photo_data['filename'])
         upload_folder = current_app.config['UPLOAD_FOLDER']
@@ -236,7 +176,7 @@ def _save_base64_photos(photos_raw, location_id):
             with open(filepath, 'wb') as f:
                 f.write(img_bytes)
         except OSError:
-            continue  # disk error, skip
+            continue
 
         db.session.add(Photo(location_id=location_id, filename=filename))
         saved += 1
@@ -244,14 +184,7 @@ def _save_base64_photos(photos_raw, location_id):
     return saved
 
 def _remove_photos(removed_raw, location_id):
-    """
-    Hard-delete photos belonging to `location_id` by filename.
-    Deletes the Photo rows first (DB is authoritative — if the file unlink
-    fails, the row is still gone and the orphan file is a cleanup job, not
-    a correctness issue). Filenames are filtered by location_id so a caller
-    can't ask us to delete another location's photo.
-    Returns the number of rows deleted.
-    """
+    # db is authoritative — orphan files on unlink failure are cleanup, not correctness
     from models import Photo
     from extensions import db
     if isinstance(removed_raw, str):
@@ -285,7 +218,6 @@ def _remove_photos(removed_raw, location_id):
 
 
 def _save_multipart_photos(files_list, location_id):
-    """Save photo files from a multipart/form-data request."""
     from models import Photo
     from extensions import db
 
@@ -296,7 +228,6 @@ def _save_multipart_photos(files_list, location_id):
         if not file or not file.filename:
             continue
 
-        # Size check — seek to end, tell, seek back
         file.seek(0, os.SEEK_END)
         size = file.tell()
         file.seek(0)
@@ -319,48 +250,16 @@ def _save_multipart_photos(files_list, location_id):
     return saved
 
 
-# ═════════════════════════════════════════════
-#  HEALTH
-# ═════════════════════════════════════════════
-
 @mobile_api.route('/health', methods=['GET'])
 def api_health():
-    """
-    Lightweight health check used by the mobile app's network probe.
-
-    Returns:
-        200: { status: 'ok', timestamp: '2026-...' }
-    """
     return jsonify({
         'status': 'ok',
         'timestamp': datetime.utcnow().isoformat(),
     }), 200
 
 
-# ═════════════════════════════════════════════
-#  AUTH ENDPOINTS
-# ═════════════════════════════════════════════
-
 @mobile_api.route('/auth/signup', methods=['POST'])
 def api_signup():
-    """
-    Register a new user account.
-
-    Request JSON:
-    {
-        "username": "string (required)",
-        "email": "string (required)",
-        "password": "string (required, min 6 chars)",
-        "user_type": "individual | organization (required)",
-        "organization_name": "string (optional, required if user_type=organization)",
-        "disability": "string | null (optional)"
-    }
-
-    Returns:
-        201: { success, message, user: { id, username, email, user_type, is_admin } }
-        400: { error } on validation failure
-        409: { error } on duplicate email/username
-    """
     from models import User
     from extensions import db
     ADMIN_EMAILS = current_app.config.get('ADMIN_EMAILS', [])
@@ -428,15 +327,6 @@ def api_signup():
 
 @mobile_api.route('/auth/login', methods=['POST'])
 def api_login():
-    """
-    Authenticate and receive JWT tokens.
-
-    Request JSON: { "email": str, "password": str }
-
-    Returns:
-        200: { access_token, refresh_token, user: {...} }
-        401: { error } on invalid credentials
-    """
     from models import User
 
     data = request.get_json(silent=True)
@@ -450,9 +340,7 @@ def api_login():
     if not user or not bcrypt.check_password_hash(user.password, password):
         return jsonify({'error': 'Invalid email or password'}), 401
 
-    # IMPORTANT: identity MUST be a string under flask-jwt-extended >= 4.6.
-    # We also stash is_admin in additional_claims so the refresh endpoint
-    # can preserve it without another DB lookup.
+    # identity must be string under flask-jwt-extended >= 4.6
     access_token = create_access_token(
         identity=str(user.id),
         additional_claims={'is_admin': user.is_admin},
@@ -479,15 +367,6 @@ def api_login():
 @mobile_api.route('/auth/refresh', methods=['POST'])
 @jwt_required(refresh=True)
 def api_refresh():
-    """
-    Refresh an expired access token using a valid refresh token.
-
-    Headers: Authorization: Bearer <refresh_token>
-
-    Returns:
-        200: { access_token }
-        404: { error } if the user has been deleted since the token was issued
-    """
     from models import User
     from extensions import db
 
@@ -509,12 +388,6 @@ def api_refresh():
 @mobile_api.route('/auth/me', methods=['GET'])
 @jwt_required()
 def api_me():
-    """
-    Get the currently authenticated user's profile.
-
-    Returns:
-        200: { user: {...} }
-    """
     user = get_current_user()
     if not user:
         return jsonify({'error': 'User not found'}), 404
@@ -536,31 +409,15 @@ def api_me():
     }), 200
 
 
-# ═════════════════════════════════════════════
-#  LOCATIONS ENDPOINTS
-# ═════════════════════════════════════════════
-
 @mobile_api.route('/locations', methods=['GET'])
 def api_get_locations():
-    """
-    Get all locations with optional filtering.
-
-    Query params:
-        category (string): Filter by category name (substring match)
-        feature (string):  Filter to locations with this accessibility feature
-        verified (bool):   Filter verified only (true/false)
-        search (string):   Search by name/name_ar/address
-
-    Returns:
-        200: [ { ...location dict... } ]
-    """
     from models import Location, Review
 
     query = Location.query.options(*_location_query_options())
 
     category = request.args.get('category')
     if category:
-        # Escape wildcards so ?category=% doesn't return everything
+        # escape wildcards so ?category=% doesn't return everything
         pattern = f'%{_escape_like(category)}%'
         query = query.filter(Location.category.ilike(pattern, escape='\\'))
 
@@ -580,9 +437,7 @@ def api_get_locations():
 
     locations = query.order_by(Location.created_at.desc()).all()
 
-    # Post-filter by feature (requires joining or iterating — we iterate
-    # because the feature list per location is always tiny, and it's
-    # already eagerly loaded so no extra queries fire here)
+    # iterate instead of join — feature list per loc is tiny and already eager-loaded
     feature_filter = request.args.get('feature')
     result = []
     for loc in locations:
@@ -600,12 +455,10 @@ def api_get_locations():
 
 @mobile_api.route('/locations/<int:location_id>', methods=['GET'])
 def api_get_location(location_id):
-    """Get a single location by ID with full details."""
     from models import Location, Review
     from extensions import db
 
-    # Use query().options() instead of session.get() so we can attach
-    # the eager-load options — session.get() does not support .options()
+    # session.get() doesn't support .options() for eager-loading
     loc = (
         db.session.query(Location)
         .options(*_location_query_options())
@@ -621,26 +474,7 @@ def api_get_location(location_id):
 @mobile_api.route('/locations', methods=['POST'])
 @jwt_required()
 def api_create_location():
-    """
-    Create a new location (authenticated users only).
-
-    Accepts either JSON or multipart/form-data (for photo uploads).
-
-    JSON fields:
-    {
-        "name": str (required),
-        "name_ar": str (required),
-        "description": str,
-        "description_ar": str,
-        "category": str (required),
-        "latitude": float (required),
-        "longitude": float (required),
-        "address": str,
-        "address_ar": str,
-        "accessibility_features": ["wheelchair_ramp", ...],
-        "photos_base64": [{"filename": "img.jpg", "data": "base64..."}]
-    }
-    """
+    # accepts json or multipart/form-data
     from models import Location, AccessibilityFeature
     from extensions import db
 
@@ -648,10 +482,8 @@ def api_create_location():
     if not user:
         return jsonify({'error': 'Authentication required'}), 401
 
-    # Parse body from either JSON or multipart
     if request.content_type and 'multipart/form-data' in request.content_type:
         data = request.form.to_dict()
-        # Form values come as strings; decode any JSON-encoded fields
         if 'accessibility_features' in data:
             data['accessibility_features'] = _safe_json_loads(
                 data['accessibility_features'], default=[]
@@ -692,9 +524,8 @@ def api_create_location():
             is_verified=False,
         )
         db.session.add(location)
-        db.session.flush()  # assign location.id without committing yet
+        db.session.flush()
 
-        # Accessibility features
         features_list = data.get('accessibility_features', []) or []
         if isinstance(features_list, str):
             features_list = _safe_json_loads(features_list, default=[])
@@ -707,15 +538,11 @@ def api_create_location():
                     available=True,
                 ))
 
-        # Photo uploads (multipart)
         if request.files:
             _save_multipart_photos(request.files.getlist('photos'), location.id)
-            
-        # Remove photos the user marked for deletion (DB + file). Done before
-        # appending so removals and additions in the same request don't fight
-        # over the per-location cap.
+
+        # remove before adding so they don't fight over the per-location cap
         _remove_photos(data.get('removed_photos', []), location.id)
-        # Photo uploads (base64 from JSON)
         _save_base64_photos(data.get('photos_base64', []), location.id)
 
         db.session.commit()
@@ -739,7 +566,6 @@ def api_create_location():
 @mobile_api.route('/locations/<int:location_id>', methods=['PUT'])
 @jwt_required()
 def api_update_location(location_id):
-    """Update an existing location (owner or admin only)."""
     from models import Location, AccessibilityFeature
     from extensions import db
 
@@ -779,7 +605,6 @@ def api_update_location(location_id):
             except (TypeError, ValueError):
                 return jsonify({'error': 'Invalid longitude'}), 400
 
-        # Replace accessibility features wholesale
         if 'accessibility_features' in data:
             AccessibilityFeature.query.filter_by(location_id=location.id).delete()
             features_list = data['accessibility_features']
@@ -797,11 +622,8 @@ def api_update_location(location_id):
                     ))
 
 
-        # Remove photos the user marked for deletion (DB + file). Done before
-        # appending so removals and additions in the same request don't fight
-        # over the per-location cap.
+        # remove before adding so they don't fight over the per-location cap
         _remove_photos(data.get('removed_photos', []), location.id)
-        # Append new photos (existing ones preserved)
         _save_base64_photos(data.get('photos_base64', []), location.id)
 
         db.session.commit()
@@ -825,14 +647,7 @@ def api_update_location(location_id):
 @mobile_api.route('/locations/<int:location_id>', methods=['DELETE'])
 @jwt_required()
 def api_delete_location(location_id):
-    """
-    Delete a location (owner or admin only).
-
-    Important: we delete the DB row FIRST, then the files. This keeps the
-    database authoritative — if file deletion fails the DB is still
-    consistent (the row is gone, orphan files are a cleanup job, not a
-    correctness issue).
-    """
+    # delete db row first — orphan files are cleanup, not correctness
     from models import Location
     from extensions import db
 
@@ -847,7 +662,7 @@ def api_delete_location(location_id):
     if location.user_id != user.id and not user.is_admin:
         return jsonify({'error': 'You do not have permission to delete this location'}), 403
 
-    # Collect filenames BEFORE deleting the row (so the relationship resolves)
+    # collect filenames before deleting so the relationship still resolves
     photo_files = [p.filename for p in location.photos]
 
     try:
@@ -857,7 +672,6 @@ def api_delete_location(location_id):
         db.session.rollback()
         return jsonify({'error': 'Failed to delete location'}), 500
 
-    # Best-effort file cleanup — errors logged but don't fail the request
     upload_folder = current_app.config['UPLOAD_FOLDER']
     for filename in photo_files:
         filepath = os.path.join(upload_folder, filename)
@@ -872,22 +686,9 @@ def api_delete_location(location_id):
     return jsonify({'success': True, 'message': 'Location deleted successfully'}), 200
 
 
-# ═════════════════════════════════════════════
-#  REVIEWS ENDPOINTS
-# ═════════════════════════════════════════════
-
 @mobile_api.route('/locations/<int:location_id>/reviews', methods=['POST'])
 @jwt_required()
 def api_add_review(location_id):
-    """
-    Add a review to a location.
-
-    Request JSON:
-    {
-        "rating": int (1-5, required),
-        "comment": str (optional)
-    }
-    """
     from models import Location, Review
     from extensions import db
 
@@ -902,9 +703,7 @@ def api_add_review(location_id):
     if not data:
         return jsonify({'error': 'Request body required'}), 400
 
-    # Rating validation — accept numeric types but reject booleans.
-    # isinstance(True, int) is True in Python, which would otherwise
-    # let {"rating": true} through as a 1-star review.
+    # reject booleans — isinstance(True, int) is True so {"rating": true} would pass as 1-star
     raw_rating = data.get('rating')
     if isinstance(raw_rating, bool) or raw_rating is None:
         return jsonify({'error': 'Rating must be a number between 1 and 5'}), 400
@@ -944,10 +743,7 @@ def api_add_review(location_id):
 @mobile_api.route('/reviews/<int:review_id>', methods=['DELETE'])
 @jwt_required()
 def api_delete_review(review_id):
-    """
-    Delete a review. Owner can delete their own; admin can delete any
-    but must provide a reason (which gets logged).
-    """
+    # admin must provide a reason; owner can delete their own without one
     from models import Review
     from extensions import db
 
@@ -984,18 +780,9 @@ def api_delete_review(review_id):
         return jsonify({'error': 'Failed to delete review'}), 500
 
 
-# ═════════════════════════════════════════════
-#  REPORTS ENDPOINTS
-# ═════════════════════════════════════════════
-
 @mobile_api.route('/locations/<int:location_id>/report', methods=['POST'])
 @jwt_required()
 def api_report_location(location_id):
-    """
-    Report a location for issues.
-
-    Request JSON: { "reason": str (required), "description": str (optional) }
-    """
     from models import Location, Report
     from extensions import db
 
@@ -1030,23 +817,12 @@ def api_report_location(location_id):
     return jsonify({'success': True, 'message': 'Report submitted'}), 201
 
 
-# ═════════════════════════════════════════════
-#  CHATBOT ENDPOINT
-# ═════════════════════════════════════════════
-
 import math
 import re
 
 
 def _haversine_km(lat1, lon1, lat2, lon2):
-    """
-    Return the great-circle distance in kilometres between two
-    (lat, lon) points using the Haversine formula.
-
-    This is pure math — no external libraries needed.
-    The formula works by treating the Earth as a sphere (radius ~6371 km),
-    projecting both points onto it, and computing the arc between them.
-    """
+    """great-circle distance in km between two (lat, lon) points."""
     R = 6371.0
     φ1, φ2 = math.radians(lat1), math.radians(lat2)
     Δφ = math.radians(lat2 - lat1)
@@ -1056,34 +832,13 @@ def _haversine_km(lat1, lon1, lat2, lon2):
 
 
 def _fuzzy_name_match(name, text, min_matches=3):
-    """
-    Return True if enough distinctive words from `name` appear in `text`.
-
-    Why fuzzy instead of exact?
-    The model often paraphrases location names slightly — different
-    spelling, dropped words, missing address suffixes — so exact
-    substring matching misses valid mentions. Instead we split both
-    the name and the response into words and count how many name-words
-    appear in the response. If enough match, we treat it as a mention.
-
-    Works for both Arabic and English scripts.
-
-    Parameters:
-        name:        the location's name or name_ar from the DB
-        text:        the model's response text
-        min_matches: minimum number of words that must match.
-                     Defaults to 3 — enough to avoid false positives
-                     from common short words while handling paraphrasing.
-                     If the name has fewer than min_matches words, ALL
-                     words must match instead.
-    """
+    """true if enough distinctive words from name appear in text.
+    fuzzy because the model often paraphrases location names."""
     if not name or not text:
         return False
     name_lower = name.lower()
     text_lower = text.lower()
-    # Split on whitespace, Arabic comma, Latin comma, and periods.
-    # Filter out very short words (≤2 chars) like "في", "of", "the"
-    # which are too common to be meaningful match signals.
+    # drop short words like "في", "of", "the" — too common to be a signal
     words = [w for w in re.split(r'[\s،,\.]+', name_lower) if len(w) > 2]
     if not words:
         return False
@@ -1093,14 +848,7 @@ def _fuzzy_name_match(name, text, min_matches=3):
 
 
 def _build_location_context(user_lat=None, user_lon=None, limit=30):
-    """
-    Query the database for locations and return a tuple of:
-        - text_context:  plain-text lines for the LLM system prompt
-        - structured:    list of location dicts for card rendering in the app
-
-    Sorted by distance (closest first) if GPS is provided,
-    otherwise sorted by average rating descending.
-    """
+    """returns (text_context, structured) — sorted by distance if gps given, else by rating."""
     from models import Location
 
     try:
@@ -1117,21 +865,18 @@ def _build_location_context(user_lat=None, user_lon=None, limit=30):
 
     rows = []
     for loc in locations:
-        # ── Average rating ──────────────────────────────────────────
         avg = (
             round(sum(r.rating for r in loc.reviews) / len(loc.reviews), 1)
             if loc.reviews else None
         )
         rating_str = f"{avg}⭐ ({len(loc.reviews)} reviews)" if avg else "no ratings yet"
 
-        # ── Distance ────────────────────────────────────────────────
         dist_str = ""
         dist_km  = None
         if user_lat is not None and user_lon is not None:
             dist_km  = _haversine_km(user_lat, user_lon, loc.latitude, loc.longitude)
             dist_str = f" | {dist_km:.1f} km away"
 
-        # ── Accessibility features (available ones only) ────────────
         available_features = [
             f.feature_type.replace('_', ' ')
             for f in loc.accessibility_features
@@ -1156,7 +901,6 @@ def _build_location_context(user_lat=None, user_lon=None, limit=30):
             'loc':     loc,
         })
 
-    # Sort by distance if GPS available, otherwise by rating
     if user_lat is not None:
         rows.sort(key=lambda r: r['dist_km'] if r['dist_km'] is not None else 9999)
     else:
@@ -1164,10 +908,8 @@ def _build_location_context(user_lat=None, user_lon=None, limit=30):
 
     top = rows[:limit]
 
-    # ── Plain-text block for the LLM ───────────────────────────────
     text_context = '\n'.join(r['text'] for r in top)
 
-    # ── Structured list for card rendering ─────────────────────────
     structured = []
     for r in top:
         loc = r['loc']
@@ -1198,39 +940,9 @@ def _build_location_context(user_lat=None, user_lon=None, limit=30):
 @mobile_api.route('/chatbot', methods=['POST'])
 @jwt_required()
 def api_chatbot():
-    """
-    AI-powered accessibility assistant using Gemma 4 31B via OpenRouter.
-    Requires a valid JWT — anonymous access is not permitted.
-
-    The LLM receives a real snapshot of the database plus the current
-    user's name and disability context so it can personalise responses.
-    GPS coordinates are used silently for distance sorting and are never
-    exposed to the model or returned to the client.
-
-    Falls back to keyword matching if the API key is missing or the
-    LLM call fails for any reason.
-
-    Request JSON:
-    {
-        "message":          str   (required),
-        "lang":             str   ("en" | "ar", default "en"),
-        "lat":              float (optional — user's GPS latitude),
-        "lng":              float (optional — user's GPS longitude),
-        "location_enabled": bool  (optional — whether location permission is granted)
-    }
-
-    Returns:
-    {
-        "response":    str,
-        "suggestions": [str, ...],
-        "locations":   [ { id, name, name_ar, category, address, address_ar,
-                           latitude, longitude, avg_rating, review_count,
-                           is_verified, distance_km, features, photo } ]
-    }
-    """
+    """ai assistant via openrouter gemma. falls back to keyword matching on failure."""
     import requests as http_requests
 
-    # ── Auth ──────────────────────────────────────────────────────────
     user = get_current_user()
     if not user:
         return jsonify({'error': 'Authentication required'}), 401
@@ -1245,9 +957,7 @@ def api_chatbot():
     if not message:
         return jsonify({'error': 'Message is required'}), 400
 
-    # ── Parse optional GPS coordinates ────────────────────────────────
-    # Coordinates are used ONLY for distance calculations and sorting.
-    # They are never passed to the LLM or included in any response.
+    # coordinates are used only for distance sorting, never exposed to llm or client
     user_lat         = user_lon = None
     location_enabled = bool(data.get('location_enabled', False))
 
@@ -1256,13 +966,8 @@ def api_chatbot():
             user_lat = float(data['lat'])
             user_lon = float(data['lng'])
     except (TypeError, ValueError):
-        pass  # bad coords → treat as if not provided
+        pass
 
-    # ── Build location status for the prompt ──────────────────────────
-    # Three possible states:
-    #   1. Coords received       → distances available, use them silently
-    #   2. Enabled but no fix    → permission granted but GPS not ready yet
-    #   3. Disabled/denied       → tell user to enable permission if they ask
     if user_lat is not None:
         location_status = (
             "The user has enabled location permissions and their position is known. "
@@ -1293,7 +998,6 @@ def api_chatbot():
             "their location under any circumstances."
         )
 
-    # ── Build user context for the prompt ─────────────────────────────
     disability_context = (
         f"The user has indicated the following about their disability or accessibility needs: {user.disability}"
         if user.disability and user.disability.strip()
@@ -1302,7 +1006,6 @@ def api_chatbot():
 
     api_key = current_app.config.get('OPENROUTER_API_KEY', '')
 
-    # ── LLM path ───────────────────────────────────────────────────────
     if api_key:
         location_context, all_locations_structured = _build_location_context(
             user_lat, user_lon
@@ -1376,7 +1079,6 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
                 suggestions   = []
                 response_text = raw_content
 
-                # ── Parse SUGGESTIONS line ───────────────────────────
                 if 'SUGGESTIONS:' in raw_content:
                     parts         = raw_content.split('SUGGESTIONS:', 1)
                     response_text = parts[0].strip()
@@ -1394,12 +1096,7 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
                         else ['مطاعم ومقاهي', 'رعاية صحية', 'مراكز تسوق', 'حدائق']
                     )
 
-                # ── Match locations by scanning the response text ─────
-                # Uses fuzzy word-overlap matching instead of exact
-                # substring matching because the model often paraphrases
-                # location names slightly. Checks both English (name) and
-                # Arabic (name_ar) since the model responds in the user's
-                # language and writes names accordingly.
+                # fuzzy match since the model paraphrases names; check both en and ar
                 locations_for_cards = [
                     loc for loc in all_locations_structured
                     if _fuzzy_name_match(loc['name'], response_text)
@@ -1418,9 +1115,7 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
 
         except Exception as e:
             current_app.logger.warning('OpenRouter chatbot call failed: %s', e)
-        # Fall through to keyword fallback ↓
 
-    # ── Keyword fallback (no API key or LLM call failed) ──────────────
     msg_lower = message.lower()
 
     keyword_responses_en = {
@@ -1523,14 +1218,9 @@ Location categories: Restaurants & Cafes, Shopping Malls, Supermarkets, Healthca
     }), 200
 
 
-# ═════════════════════════════════════════════
-#  ACCESSIBILITY SETTINGS
-# ═════════════════════════════════════════════
-
 @mobile_api.route('/accessibility-settings', methods=['GET'])
 @jwt_required()
 def api_get_accessibility_settings():
-    """Get the current user's accessibility settings."""
     user = get_current_user()
     if not user:
         return jsonify({'error': 'User not found'}), 404
@@ -1540,18 +1230,6 @@ def api_get_accessibility_settings():
 @mobile_api.route('/accessibility-settings', methods=['PUT'])
 @jwt_required()
 def api_update_accessibility_settings():
-    """
-    Update accessibility settings.
-
-    Request JSON:
-    {
-        "highContrast": bool,
-        "textSize": int,
-        "dyslexiaFont": bool,
-        "reducedMotion": bool,
-        "colorBlindMode": "none" | "protanopia" | "deuteranopia" | "tritanopia"
-    }
-    """
     from extensions import db
 
     user = get_current_user()
@@ -1563,7 +1241,6 @@ def api_update_accessibility_settings():
         return jsonify({'error': 'Request body required'}), 400
 
     try:
-        # Ensure it's serializable before we commit
         serialized = json.dumps(data)
         user.accessibility_settings = serialized
         db.session.commit()
@@ -1577,14 +1254,9 @@ def api_update_accessibility_settings():
     return jsonify({'success': True, 'settings': data}), 200
 
 
-# ═════════════════════════════════════════════
-#  USER PROFILE LOCATIONS
-# ═════════════════════════════════════════════
-
 @mobile_api.route('/my-locations', methods=['GET'])
 @jwt_required()
 def api_my_locations():
-    """Get all locations created by the current user."""
     from models import Location, Review
 
     user = get_current_user()
@@ -1599,24 +1271,14 @@ def api_my_locations():
         .all()
     )
 
-    # Use the same serializer the other endpoints use — guarantees field
-    # parity between /locations and /my-locations.
     return jsonify([_serialize_location(loc, include_reviews=False) for loc in locations]), 200
 
 
-# ═════════════════════════════════════════════
-#  STATIC FILE HELPER (for photo URLs)
-# ═════════════════════════════════════════════
-
 @mobile_api.route('/uploads/<path:filename>', methods=['GET'])
 def api_serve_upload(filename):
-    """
-    Serve uploaded photos. The mobile app constructs image URLs as:
-        {BASE_URL}/api/v1/uploads/{filename}
-    """
     from flask import send_from_directory
 
-    # Prevent path traversal — only serve filenames that are safe basenames
+    # prevent path traversal
     safe_name = os.path.basename(filename)
     if safe_name != filename or not safe_name:
         abort(404)

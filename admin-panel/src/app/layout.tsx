@@ -36,14 +36,7 @@ export const viewport: Viewport = {
   ],
 };
 
-/**
- * Pre-hydration script.
- * ---------------------
- * Runs before React hydrates — reads the persisted theme & language from
- * localStorage and sets the right classes + dir on <html> so the first paint
- * matches what the user last picked. Without this the page flashes dark/LTR
- * for a frame and then snaps to light/RTL.
- */
+// runs before react hydrates — prevents a flash of wrong theme/dir on first paint
 const preHydrationScript = `(function(){try{
   var t = localStorage.getItem('joa-theme');
   var l = localStorage.getItem('joa-lang');

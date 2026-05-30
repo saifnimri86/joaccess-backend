@@ -7,7 +7,6 @@ interface StatCardProps {
   label: string;
   value: number;
   icon: LucideIcon;
-  /** Icon tint — one of the semantic CSS vars, or maroon */
   tone?: "maroon" | "success" | "warn" | "danger" | "muted";
   suffix?: string;
   decimals?: number;

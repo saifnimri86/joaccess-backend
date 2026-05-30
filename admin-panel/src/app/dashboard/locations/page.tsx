@@ -17,7 +17,7 @@ import { useLanguage } from "@/contexts/LanguageContext";
 import { useTheme } from "@/contexts/ThemeContext";
 import { toast } from "@/lib/toast";
 
-// Leaflet must be dynamically imported — it requires `window`
+// leaflet requires window, must be dynamically imported
 const LocationsMap = dynamic(
   () => import("@/components/ui/LocationsMap").then((m) => m.LocationsMap),
   { ssr: false, loading: () => <div className="skeleton w-full" style={{ height: 380, borderRadius: 12 }} /> }
@@ -28,7 +28,6 @@ const CATEGORIES = [
   "education","hotels","mosque","library","gym","pharmacy",
 ];
 
-// Stable query key for the full location cache
 const ALL_LOCS_KEY = ["admin-locations-all"] as const;
 
 type CacheShape = { locations: Location[]; total: number; pages: number };
@@ -45,7 +44,7 @@ export default function LocationsPage() {
   const [toDelete, setToDelete] = useState<Location | null>(null);
   const [photoLoc, setPhotoLoc] = useState<Location | null>(null);
 
-  // Debounce search by 350 ms — table only fires a request after typing stops
+  // 350ms debounce so search doesn't fire per keystroke
   useEffect(() => {
     const id = setTimeout(() => setDebouncedSearch(search), 350);
     return () => clearTimeout(id);
@@ -53,7 +52,6 @@ export default function LocationsPage() {
 
   useEffect(() => { setPage(1); }, [debouncedSearch, category, verified]);
 
-  // Paginated table query — uses debouncedSearch to avoid per-keystroke requests
   const { data, isLoading } = useQuery({
     queryKey: ["admin-locations", page, debouncedSearch, category, verified],
     queryFn: () =>
@@ -67,9 +65,7 @@ export default function LocationsPage() {
     placeholderData: (prev) => prev,
   });
 
-  // Full location cache — fetched once per browser session, never automatically refetched.
-  // staleTime: Infinity means React Query will never consider it stale and trigger a background refetch.
-  // gcTime: Infinity prevents eviction from the cache while the tab is open.
+  // fetched once per session for the map; never auto-refetched
   const { data: allData } = useQuery<CacheShape>({
     queryKey: ALL_LOCS_KEY,
     queryFn: () => getLocations({ page: 1, per_page: 2000 }),
@@ -80,8 +76,7 @@ export default function LocationsPage() {
   const allCachedLocations = allData?.locations ?? [];
   const isFiltered = !!(search || category || verified);
 
-  // Client-side filtering for the map — instant, no network round-trip.
-  // Uses the real-time `search` value (not debounced) so pins update as you type.
+  // client-side filter — uses real-time search so pins update as you type
   const mapLocations = useMemo(() => {
     if (!isFiltered) return allCachedLocations;
     const q = search.toLowerCase();
@@ -100,8 +95,7 @@ export default function LocationsPage() {
     });
   }, [allCachedLocations, search, category, verified, isFiltered]);
 
-  // Optimistically patch the full cache after mutations so the map
-  // reflects changes immediately without a network refetch.
+  // optimistic patch so the map updates without refetching
   function patchCache(updater: (locs: Location[]) => Location[]) {
     qc.setQueryData<CacheShape>(ALL_LOCS_KEY, (old) => {
       if (!old) return old;
@@ -154,7 +148,6 @@ export default function LocationsPage() {
         </div>
       </div>
 
-      {/* Map */}
       <div className="card overflow-hidden animate-fade-up delay-75" style={{ padding: 0 }}>
         <div className="px-4 pt-3 pb-2 flex items-center justify-between" style={{ borderBottom: "1px solid var(--c-border)" }}>
           <div className="flex items-center gap-2">
@@ -181,7 +174,6 @@ export default function LocationsPage() {
         />
       </div>
 
-      {/* Filters */}
       <div className="card p-4 animate-fade-up delay-100">
         <div className="flex flex-wrap gap-3">
           <div className="relative flex-1 min-w-52">
@@ -207,7 +199,6 @@ export default function LocationsPage() {
         </div>
       </div>
 
-      {/* Table */}
       <div className="card overflow-hidden animate-fade-up delay-150">
         <div className="overflow-x-auto">
           <table className="data-table">

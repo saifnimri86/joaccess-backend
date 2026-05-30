@@ -21,7 +21,7 @@ export default function AIInsightsPage() {
   const { mutate, isPending } = useMutation({
     mutationFn: getAIInsights,
     onSuccess: (data) => {
-      // Remove backticks and possible "json" identifiers
+      // strip code-fences from the markdown
       let clean = data.insights.replace(/```json/gi, "").replace(/```/g, "");
       clean = clean.replace(/json\s*$/i, "").trim();
       data.insights = clean;
@@ -96,7 +96,6 @@ export default function AIInsightsPage() {
 
   return (
     <div className="space-y-6 max-w-3xl mx-auto flex flex-col items-center w-full">
-      {/* Header */}
       <div className="animate-fade-up w-full flex flex-col items-center text-center">
         <h1 className="font-display text-2xl font-bold tracking-tight flex items-center gap-2" style={{ color: "var(--c-ink)" }}>
           <Sparkles size={22} style={{ color: "var(--color-maroon-300)" }} />
@@ -107,7 +106,6 @@ export default function AIInsightsPage() {
         </p>
       </div>
 
-      {/* Report & Top Actions */}
       {result && (
         <div className="w-full flex-col flex items-center animate-fade-up mt-4">
           <div className="flex gap-4 w-full justify-center mb-6">
@@ -191,7 +189,6 @@ export default function AIInsightsPage() {
         </div>
       )}
 
-      {/* Styles for strict light/dark targeting without assuming Tailwind config */ }
       <style>{`
         .report-text {
           color: #FFFFFF;
@@ -204,7 +201,6 @@ export default function AIInsightsPage() {
         }
       `}</style>
 
-      {/* Hero card (hidden if result exists) */}
       {!result && (
         <div
           className="card p-8 text-center animate-fade-up delay-100 relative overflow-hidden w-full"
@@ -250,7 +246,6 @@ export default function AIInsightsPage() {
         </div>
       )}
 
-      {/* Error */}
       {error && (
         <div className="card p-4 flex items-start gap-3 animate-fade-in w-full text-left" style={{ borderColor: "var(--c-danger-bdr)" }}>
           <AlertTriangle size={16} className="mt-0.5 shrink-0" style={{ color: "var(--c-danger)" }} />

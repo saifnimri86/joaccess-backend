@@ -46,7 +46,6 @@ export default function LoginPage() {
       className="min-h-screen flex items-center justify-center relative overflow-hidden"
       style={{ background: "var(--c-bg)" }}
     >
-      {/* Ambient glow */}
       <div
         className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] rounded-full pointer-events-none"
         style={{
@@ -54,7 +53,6 @@ export default function LoginPage() {
           filter: "blur(80px)",
         }}
       />
-      {/* Grid pattern */}
       <div
         className="absolute inset-0 pointer-events-none"
         style={{
@@ -65,7 +63,6 @@ export default function LoginPage() {
         }}
       />
 
-      {/* Top-end controls (logical, so they flip in RTL) */}
       <div className="absolute top-4 end-4 flex items-center gap-2 z-10">
         <button onClick={toggleLang} className="toggle-pill" title="Toggle language">
           <Globe size={13} />
@@ -76,10 +73,8 @@ export default function LoginPage() {
         </button>
       </div>
 
-      {/* Card */}
       <div className="relative w-full max-w-md mx-4 animate-fade-up">
         <div className="card p-8" style={{ boxShadow: "0 20px 60px var(--c-shadow)" }}>
-          {/* Logo */}
           <div className="flex flex-col items-center mb-8">
             <div
               className="w-14 h-14 rounded-2xl flex items-center justify-center mb-4"
@@ -95,7 +90,6 @@ export default function LoginPage() {
             </p>
           </div>
 
-          {/* Form */}
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>
               <label className="block text-xs font-semibold uppercase tracking-widest mb-1.5" style={{ color: "var(--c-ink-muted)" }}>
@@ -165,7 +159,6 @@ export default function LoginPage() {
         </div>
       </div>
 
-      {/* Silence unused-var lint for isRTL (kept in case we need it) */}
       <span className="hidden">{isRTL ? "" : ""}</span>
     </div>
   );

@@ -117,7 +117,6 @@ export const translations = {
     ai_recs:        "Recommendations",
     ai_empty:       "Click the button above to run your first analysis",
 
-    // ── CV photo verification ─────────────────────────────────────
     cv_modal_title:    "Photo Verification",
     cv_analyze:        "Analyze with AI",
     cv_analyze_short:  "AI",
@@ -256,7 +255,6 @@ export const translations = {
     ai_recs:        "التوصيات",
     ai_empty:       "انقر على الزر أعلاه لتشغيل أول تحليل",
 
-    // ── CV photo verification ─────────────────────────────────────
     cv_modal_title:    "التحقق من الصور",
     cv_analyze:        "تحليل بالذكاء الاصطناعي",
     cv_analyze_short:  "AI",
@@ -296,10 +294,7 @@ export function translate(
   return text;
 }
 
-// ─── Enum label maps ─────────────────────────────────────────────────────────
-// Values come from the backend as raw English strings. These maps provide
-// Arabic translations; English falls back to a capitalized/spaced form.
-
+// backend sends raw english; ar uses these maps, en falls back to a capitalized form
 const CATEGORY_AR: Record<string, string> = {
   restaurant: "مطعم",
   government:  "حكومي",

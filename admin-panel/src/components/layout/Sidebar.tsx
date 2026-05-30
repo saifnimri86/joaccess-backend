@@ -41,7 +41,6 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void } = {}) {
         borderInlineEnd: "1px solid var(--c-border)",
       }}
     >
-      {/* Brand */}
       <div className="px-5 py-5 flex items-center gap-3" style={{ borderBottom: "1px solid var(--c-border)" }}>
         <Logo size={56} className="shrink-0" style={{ color: theme === "dark" ? "#B33838" : "#800000" }} />
         <div>
@@ -54,7 +53,6 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void } = {}) {
         </div>
       </div>
 
-      {/* Nav */}
       <nav className="flex-1 px-3 py-4 space-y-0.5 overflow-y-auto">
         {NAV.map(({ href, icon: Icon, labelKey }) => {
           const exact = href === "/dashboard";
@@ -73,7 +71,6 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void } = {}) {
         })}
       </nav>
 
-      {/* Signout */}
       <div className="px-3 py-4" style={{ borderTop: "1px solid var(--c-border)" }}>
         <button onClick={logout} className="btn-signout">
           <LogOut size={15} className="shrink-0" />

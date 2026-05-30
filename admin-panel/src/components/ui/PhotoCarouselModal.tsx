@@ -41,14 +41,12 @@ export function PhotoCarouselModal({ open, photos, locationName, onClose }: Phot
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      {/* Backdrop */}
       <div
         className="absolute inset-0 backdrop-blur-sm animate-fade-in"
         style={{ background: "rgba(0,0,0,0.8)" }}
         onClick={onClose}
       />
 
-      {/* Modal */}
       <div
         className="relative flex flex-col animate-fade-up"
         style={{ width: "min(720px, 100%)", maxHeight: "90vh" }}
@@ -56,7 +54,6 @@ export function PhotoCarouselModal({ open, photos, locationName, onClose }: Phot
         aria-modal="true"
         aria-label={`Photos of ${locationName}`}
       >
-        {/* Header */}
         <div
           className="flex items-center justify-between px-4 py-3 rounded-t-xl"
           style={{ background: "var(--c-surface)", borderBottom: "1px solid var(--c-border)" }}
@@ -72,7 +69,6 @@ export function PhotoCarouselModal({ open, photos, locationName, onClose }: Phot
           </button>
         </div>
 
-        {/* Image area */}
         <div
           className="relative flex items-center justify-center overflow-hidden"
           style={{ background: "#000", minHeight: 320, maxHeight: "70vh" }}
@@ -86,7 +82,6 @@ export function PhotoCarouselModal({ open, photos, locationName, onClose }: Phot
             style={{ maxHeight: "70vh" }}
           />
 
-          {/* Prev / Next — only shown when more than one photo */}
           {photos.length > 1 && (
             <>
               <button
@@ -109,7 +104,6 @@ export function PhotoCarouselModal({ open, photos, locationName, onClose }: Phot
           )}
         </div>
 
-        {/* Dot strip */}
         {photos.length > 1 && (
           <div
             className="flex items-center justify-center gap-1.5 py-2.5 rounded-b-xl"

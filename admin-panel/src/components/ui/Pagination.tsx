@@ -25,8 +25,7 @@ export function Pagination({ page, total_pages, onPage }: PaginationProps) {
     pages.push(total_pages);
   }
 
-  // Arrows follow the reading direction — in RTL "previous" should visually
-  // point toward the right (the direction prior pages exist).
+  // arrows follow reading direction
   const PrevIcon = isRTL ? ChevronRight : ChevronLeft;
   const NextIcon = isRTL ? ChevronLeft : ChevronRight;
 

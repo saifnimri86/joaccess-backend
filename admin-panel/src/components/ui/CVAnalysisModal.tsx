@@ -15,25 +15,6 @@ interface CVAnalysisModalProps {
   onClose: () => void;
 }
 
-/**
- * CVAnalysisModal
- * ----------------
- * Modal that runs the EfficientNet-B0 classifier on every photo of a
- * location and displays per-class confidence scores side-by-side with
- * each photo. Used by admins to verify whether photo content matches
- * the user's claimed accessibility features.
- *
- * Layout decisions:
- *   - Two-pane: photo on the left, scores on the right. Switches to
- *     stacked on narrow widths.
- *   - Photo carousel preserved (chevrons + dots) so the admin can flip
- *     through photos and watch the right pane update in lockstep.
- *   - Per-class scores rendered as horizontal bars with the predicted
- *     class highlighted in maroon. The bar widths use the actual
- *     percentage (0–100) directly.
- *   - "Match badge" — green if the predicted class is one of the
- *     location's claimed accessibility features, amber otherwise.
- */
 export function CVAnalysisModal({
   open,
   locationId,
@@ -50,7 +31,6 @@ export function CVAnalysisModal({
 
   useEffect(() => setMounted(true), []);
 
-  // Reset state when the modal opens for a new location, kick off analysis
   useEffect(() => {
     if (!open || !locationId) {
       setIndex(0);
@@ -59,11 +39,9 @@ export function CVAnalysisModal({
       return;
     }
 
-    // Lock body scroll while modal is open
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
 
-    // Keyboard nav: Esc closes, arrows flip through photos
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
       if (e.key === "ArrowLeft") setIndex((i) => (i - 1 + photos.length) % Math.max(1, photos.length));
@@ -71,8 +49,6 @@ export function CVAnalysisModal({
     };
     window.addEventListener("keydown", onKey);
 
-    // Auto-trigger analysis as soon as the modal opens — admins always
-    // want the results, no point making them click a second button.
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -97,16 +73,13 @@ export function CVAnalysisModal({
     };
   }, [open, locationId, photos.length, onClose]);
 
-  // Look up the result for the currently-displayed photo by URL match.
-  // The backend preserves photo order, so we could also index by position,
-  // but matching by URL is more defensive against any reshuffling.
+  // match by url in case backend reshuffles
   const currentResult: CVPhotoResult | null = useMemo(() => {
     if (!analysis || !photos[index]) return null;
     const targetUrl = photos[index];
     return analysis.results.find((r) => r.photo_url === targetUrl) ?? null;
   }, [analysis, photos, index]);
 
-  // Derive a sorted-by-confidence list for nice descending bar display
   const sortedScores = useMemo(() => {
     if (!currentResult?.all_scores) return [];
     return Object.entries(currentResult.all_scores)
@@ -118,21 +91,18 @@ export function CVAnalysisModal({
   const prev = () => setIndex((i) => (i - 1 + photos.length) % Math.max(1, photos.length));
   const next = () => setIndex((i) => (i + 1) % Math.max(1, photos.length));
 
-  // Is the predicted class one the location actually claims?
   const isMatch = currentResult?.success
     && analysis?.claimed_features.includes(currentResult.predicted_class ?? "")
     || false;
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      {/* Backdrop */}
       <div
         className="absolute inset-0 backdrop-blur-sm animate-fade-in"
         style={{ background: "rgba(0,0,0,0.85)" }}
         onClick={onClose}
       />
 
-      {/* Modal shell */}
       <div
         className="relative flex flex-col animate-fade-up rounded-xl overflow-hidden"
         style={{
@@ -146,7 +116,6 @@ export function CVAnalysisModal({
         aria-modal="true"
         aria-label={`CV Analysis for ${locationName}`}
       >
-        {/* ── Header ───────────────────────────────────────── */}
         <div
           className="flex items-center justify-between px-5 py-4"
           style={{ borderBottom: "1px solid var(--c-border)" }}
@@ -176,7 +145,6 @@ export function CVAnalysisModal({
           </button>
         </div>
 
-        {/* ── Summary strip ────────────────────────────────── */}
         {analysis && (
           <div
             className="px-5 py-3 flex flex-wrap items-center gap-3 text-xs"
@@ -219,7 +187,6 @@ export function CVAnalysisModal({
           </div>
         )}
 
-        {/* ── Main two-pane area ───────────────────────────── */}
         <div className="flex-1 overflow-y-auto">
           {photos.length === 0 ? (
             <div className="p-12 text-center" style={{ color: "var(--c-ink-muted)" }}>
@@ -228,7 +195,6 @@ export function CVAnalysisModal({
             </div>
           ) : (
             <div className="grid md:grid-cols-2 gap-0" style={{ minHeight: 460 }}>
-              {/* Left: photo viewer */}
               <div
                 className="relative flex items-center justify-center overflow-hidden"
                 style={{ background: "#000", minHeight: 320, maxHeight: "62vh" }}
@@ -242,7 +208,6 @@ export function CVAnalysisModal({
                   style={{ maxHeight: "62vh" }}
                 />
 
-                {/* Photo counter pill */}
                 <div
                   className="absolute top-3 start-3 px-2.5 py-1 rounded-full text-xs font-mono"
                   style={{ background: "rgba(0,0,0,0.6)", color: "#F0ECEC" }}
@@ -250,7 +215,6 @@ export function CVAnalysisModal({
                   {index + 1} / {photos.length}
                 </div>
 
-                {/* Prev/Next */}
                 {photos.length > 1 && (
                   <>
                     <button
@@ -273,7 +237,6 @@ export function CVAnalysisModal({
                 )}
               </div>
 
-              {/* Right: scores pane */}
               <div className="p-5 flex flex-col" style={{ background: "var(--c-card)" }}>
                 {loading ? (
                   <div className="flex flex-1 flex-col items-center justify-center text-sm gap-3" style={{ color: "var(--c-ink-muted)" }}>
@@ -298,7 +261,6 @@ export function CVAnalysisModal({
                   </div>
                 ) : (
                   <>
-                    {/* Top result */}
                     <div className="mb-5">
                       <p className="text-xs uppercase tracking-widest font-semibold mb-2" style={{ color: "var(--c-ink-muted)" }}>
                         {t("cv_predicted")}
@@ -336,7 +298,6 @@ export function CVAnalysisModal({
                       )}
                     </div>
 
-                    {/* Score bars */}
                     <div className="space-y-2.5">
                       <p className="text-xs uppercase tracking-widest font-semibold mb-1" style={{ color: "var(--c-ink-muted)" }}>
                         {t("cv_all_scores")}
@@ -387,7 +348,6 @@ export function CVAnalysisModal({
           )}
         </div>
 
-        {/* ── Footer / dot strip ───────────────────────────── */}
         {photos.length > 1 && (
           <div
             className="flex items-center justify-center gap-1.5 py-2.5"
@@ -418,10 +378,6 @@ export function CVAnalysisModal({
   );
 }
 
-/**
- * Convert a snake_case class name like "wheelchair_ramp" into a
- * human-readable "Wheelchair Ramp" for display.
- */
 function formatClassName(name: string): string {
   if (!name) return "—";
   return name

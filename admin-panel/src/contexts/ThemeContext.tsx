@@ -12,8 +12,7 @@ interface ThemeCtx {
 const ThemeContext = createContext<ThemeCtx>({ theme: "dark", toggleTheme: () => {} });
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  // Default to "dark". The pre-hydration script in layout.tsx already set
-  // `html.light` if needed, so we just read from the DOM on mount.
+  // pre-hydration script in layout.tsx already set the class; read from dom
   const [theme, setTheme] = useState<Theme>("dark");
 
   useEffect(() => {

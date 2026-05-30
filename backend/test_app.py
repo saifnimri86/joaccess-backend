@@ -1,13 +1,3 @@
-"""
-test_app.py
-===========
-Basic test suite for the JOAccess Flask backend.
-
-These tests spin up the app in test mode using an in-memory SQLite database
-so no real Postgres/Supabase connection is needed in CI. Every test gets a
-fresh database thanks to the setup/teardown fixtures.
-"""
-
 import json
 import os
 import pytest
@@ -15,27 +5,13 @@ import pytest
 from app import create_app
 from extensions import db as _db
 
-# File-based SQLite path — written to /tmp so it's always writable in CI.
-# We use a file instead of :memory: because SQLAlchemy's :memory: creates
-# a NEW empty database for every connection. The test client's requests
-# each open their own connection, so they'd never see the tables created
-# by db.create_all(). A file-based DB persists across all connections
-# within the same process, solving this entirely.
+# file-based sqlite so all connections see the same tables (:memory: gives each connection its own db)
 TEST_DB_PATH = "/tmp/joaccess_test.db"
 TEST_DB_URI = f"sqlite:///{TEST_DB_PATH}"
 
 
-# ─────────────────────────────────────────────
-# FIXTURES
-# ─────────────────────────────────────────────
-
 @pytest.fixture(scope="session")
 def app():
-    """
-    Create one Flask app instance for the whole test session.
-    Uses a file-based SQLite DB so tables are visible across connections.
-    scope="session" means this runs once — not once per test.
-    """
     class TestConfig:
         TESTING = True
         SECRET_KEY = "test-secret"
@@ -54,8 +30,6 @@ def app():
         SUPABASE_SERVICE_KEY = ""
         DEBUG = False
 
-    # Remove any leftover DB file from a previous run so we always
-    # start with a clean slate
     if os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
 
@@ -65,24 +39,14 @@ def app():
 
 @pytest.fixture(scope="session")
 def client(app):
-    """Flask test client — lets us send HTTP requests without a real server."""
     return app.test_client()
 
 
 @pytest.fixture(scope="session")
 def init_db(app):
-    """
-    Create all tables once at the start of the session, drop them at the end.
-    scope="session" means this runs once total, not once per test.
-
-    We import models explicitly before calling create_all() because SQLAlchemy
-    only creates tables for model classes it has seen imported. The app factory
-    imports blueprints, but if a model class hasn't been imported yet SQLAlchemy
-    doesn't know its table exists — so create_all() silently skips it.
-    Importing models here guarantees every table is registered first.
-    """
+    # import models before create_all so sqlalchemy registers every table
     with app.app_context():
-        import models  # noqa: F401 — registers all models with SQLAlchemy metadata
+        import models  # noqa: F401
         _db.create_all()
     yield
     with app.app_context():
@@ -93,12 +57,7 @@ def init_db(app):
 
 @pytest.fixture(autouse=True)
 def clean_db(app, init_db):
-    """
-    Delete all rows from every table after each test so tests don't
-    bleed into each other. We DELETE rather than rollback because the
-    test client commits its own transactions internally.
-    autouse=True applies this to every test automatically.
-    """
+    # delete rather than rollback — test client commits its own transactions
     yield
     with app.app_context():
         for table in reversed(_db.metadata.sorted_tables):
@@ -106,12 +65,7 @@ def clean_db(app, init_db):
         _db.session.commit()
 
 
-# ─────────────────────────────────────────────
-# HELPER
-# ─────────────────────────────────────────────
-
 def post_json(client, url, data):
-    """Convenience wrapper for JSON POST requests."""
     return client.post(
         url,
         data=json.dumps(data),
@@ -120,18 +74,12 @@ def post_json(client, url, data):
 
 
 def get_auth_token(client):
-    """
-    Register an admin user and return a valid JWT access token.
-    Used by tests that need an authenticated request.
-    """
-    # Register
     post_json(client, "/api/v1/auth/signup", {
         "username": "testadmin",
-        "email": "admin@test.com",   # in ADMIN_EMAILS so is_admin=True
+        "email": "admin@test.com",
         "password": "testpass123",
         "user_type": "individual",
     })
-    # Login
     resp = post_json(client, "/api/v1/auth/login", {
         "email": "admin@test.com",
         "password": "testpass123",
@@ -140,10 +88,6 @@ def get_auth_token(client):
 
 
 def get_user_token(client):
-    """
-    Register a regular (non-admin) user and return their JWT token.
-    Used by tests that need an authenticated but non-admin request.
-    """
     post_json(client, "/api/v1/auth/signup", {
         "username": "regularuser",
         "email": "user@test.com",
@@ -156,10 +100,6 @@ def get_user_token(client):
     })
     return json.loads(resp.data)["access_token"]
 
-
-# ─────────────────────────────────────────────
-# TESTS — Health & Root
-# ─────────────────────────────────────────────
 
 class TestHealth:
     def test_root_returns_200(self, client):
@@ -190,10 +130,6 @@ class TestHealth:
         resp = client.get("/nonexistent")
         assert resp.content_type == "application/json"
 
-
-# ─────────────────────────────────────────────
-# TESTS — Auth: Signup
-# ─────────────────────────────────────────────
 
 class TestSignup:
     def test_signup_success(self, client):
@@ -232,7 +168,6 @@ class TestSignup:
         client.post("/api/v1/auth/signup",
                     data=json.dumps(payload),
                     content_type="application/json")
-        # Second signup with same email
         payload["username"] = "dupuser2"
         resp = post_json(client, "/api/v1/auth/signup", payload)
         assert resp.status_code == 409
@@ -242,7 +177,7 @@ class TestSignup:
             "username": "badtype",
             "email": "badtype@example.com",
             "password": "password123",
-            "user_type": "superadmin",  # not a valid type
+            "user_type": "superadmin",
         })
         assert resp.status_code == 400
 
@@ -250,10 +185,6 @@ class TestSignup:
         resp = client.post("/api/v1/auth/signup")
         assert resp.status_code == 400
 
-
-# ─────────────────────────────────────────────
-# TESTS — Auth: Login
-# ─────────────────────────────────────────────
 
 class TestLogin:
     def test_login_success(self, client):
@@ -297,10 +228,6 @@ class TestLogin:
         assert resp.status_code == 400
 
 
-# ─────────────────────────────────────────────
-# TESTS — Auth: Protected routes
-# ─────────────────────────────────────────────
-
 class TestProtectedRoutes:
     def test_me_without_token_returns_401(self, client):
         resp = client.get("/api/v1/auth/me")
@@ -317,13 +244,8 @@ class TestProtectedRoutes:
         assert "user" in data
 
 
-# ─────────────────────────────────────────────
-# TESTS — Locations
-# ─────────────────────────────────────────────
-
 class TestLocations:
     def test_get_locations_public(self, client):
-        """Location listing is public — no auth needed."""
         resp = client.get("/api/v1/locations")
         assert resp.status_code == 200
         assert isinstance(json.loads(resp.data), list)
@@ -347,7 +269,6 @@ class TestLocations:
             "latitude": 32.0853,
             "longitude": 35.8656,
         })
-        # Attach auth header properly
         resp = client.post(
             "/api/v1/locations",
             data=json.dumps({
@@ -379,13 +300,8 @@ class TestLocations:
         assert resp.status_code == 404
 
 
-# ─────────────────────────────────────────────
-# TESTS — Admin routes
-# ─────────────────────────────────────────────
-
 class TestAdminRoutes:
     def test_admin_login_success(self, client):
-        # Admin email is in ADMIN_EMAILS in TestConfig
         post_json(client, "/api/v1/auth/signup", {
             "username": "adminlogintest",
             "email": "admin@test.com",
@@ -467,6 +383,5 @@ class TestAdminRoutes:
         assert resp.status_code == 200
 
     def test_cv_health_without_token_returns_401(self, client):
-        """CV endpoint should be admin-only."""
         resp = client.get("/api/admin/cv/health")
         assert resp.status_code == 401

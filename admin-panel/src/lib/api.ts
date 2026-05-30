@@ -1,13 +1,3 @@
-/**
- * api.ts
- * -------
- * Centralised HTTP client for all Flask backend calls.
- * The token is stored in localStorage (client-side only).
- * Every request that needs auth picks it up from there.
- */
-
-// ─── Backend selector ────────────────────────────────────────────────────────
-
 export const BACKENDS = {
   production: process.env.NEXT_PUBLIC_API_URL_PRODUCTION ?? "https://joaccess-backend.onrender.com",
   staging:    process.env.NEXT_PUBLIC_API_URL_STAGING    ?? "https://joaccess-staging.onrender.com",
@@ -34,8 +24,6 @@ function getBase(): string {
   return BACKENDS[getBackendEnv()] ?? BACKENDS.production;
 }
 
-// ─── Token helpers ──────────────────────────────────────────────────────────
-
 export function getToken(): string | null {
   if (typeof window === "undefined") return null;
   return localStorage.getItem("joaccess_admin_token");
@@ -48,8 +36,6 @@ export function setToken(token: string): void {
 export function clearToken(): void {
   localStorage.removeItem("joaccess_admin_token");
 }
-
-// ─── Base fetch wrapper ──────────────────────────────────────────────────────
 
 async function apiFetch<T>(
   path: string,
@@ -84,8 +70,6 @@ async function apiFetch<T>(
 
   return data as T;
 }
-
-// ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface AdminUser {
   id: number;
@@ -156,7 +140,6 @@ export interface DashboardStats {
   total_reports: number;
   avg_rating: number;
   verification_rate: number;
-  // Charts
   categories: [string, number][];
   monthly_locations: [string, number][];
   monthly_users: [string, number][];
@@ -172,22 +155,16 @@ export interface AIInsightsResponse {
   generated_at: string;
 }
 
-// ─── CV Verification types ───────────────────────────────────────────────────
-
-/** One photo's classification result from the HF Space. */
 export interface CVPhotoResult {
   photo_url: string;
   success: boolean;
-  // Present when success=true
   predicted_class?: string;
   confidence?: number;
   all_scores?: Record<string, number>;
   inference_ms?: number;
-  // Present when success=false
   error?: string;
 }
 
-/** Aggregate response from POST /api/admin/locations/<id>/analyze. */
 export interface CVAnalysisResponse {
   location_id: number;
   location_name: string;
@@ -204,8 +181,6 @@ export interface CVAnalysisResponse {
   message?: string;
 }
 
-// ─── Auth ────────────────────────────────────────────────────────────────────
-
 export async function adminLogin(
   email: string,
   password: string
@@ -220,13 +195,9 @@ export async function getAdminMe(): Promise<AdminUser> {
   return apiFetch("/api/admin/me");
 }
 
-// ─── Dashboard ───────────────────────────────────────────────────────────────
-
 export async function getDashboardStats(): Promise<DashboardStats> {
   return apiFetch("/api/admin/stats");
 }
-
-// ─── Locations ───────────────────────────────────────────────────────────────
 
 export async function getLocations(params?: {
   page?: number;
@@ -257,25 +228,30 @@ export async function deleteLocation(id: number): Promise<void> {
   return apiFetch(`/api/admin/locations/${id}`, { method: "DELETE" });
 }
 
-// ─── Users ───────────────────────────────────────────────────────────────────
-
 export async function getUsers(params?: {
   page?: number;
   per_page?: number;
   search?: string;
+  user_type?: "individual" | "organization" | "";
+  role?: "admin" | "user" | "";
+  sort_by?: "reviews" | "locations" | "";
+  sort_order?: "asc" | "desc";
 }): Promise<{ users: AdminUser[]; total: number; pages: number }> {
   const q = new URLSearchParams();
-  if (params?.page) q.set("page", String(params.page));
-  if (params?.per_page) q.set("per_page", String(params.per_page));
-  if (params?.search) q.set("search", params.search);
+  if (params?.page)       q.set("page",       String(params.page));
+  if (params?.per_page)   q.set("per_page",   String(params.per_page));
+  if (params?.search)     q.set("search",     params.search);
+  if (params?.user_type)  q.set("user_type",  params.user_type);
+  if (params?.role)       q.set("role",       params.role);
+  if (params?.sort_by)    q.set("sort_by",    params.sort_by);
+  if (params?.sort_by && params?.sort_order)
+                          q.set("sort_order", params.sort_order);
   return apiFetch(`/api/admin/users?${q}`);
 }
 
 export async function deleteUser(id: number): Promise<void> {
   return apiFetch(`/api/admin/users/${id}`, { method: "DELETE" });
 }
-
-// ─── Reviews ─────────────────────────────────────────────────────────────────
 
 export async function getReviews(params?: {
   page?: number;
@@ -290,8 +266,6 @@ export async function getReviews(params?: {
 export async function deleteReview(id: number): Promise<void> {
   return apiFetch(`/api/admin/reviews/${id}`, { method: "DELETE" });
 }
-
-// ─── Reports ─────────────────────────────────────────────────────────────────
 
 export async function getReports(params?: {
   page?: number;
@@ -311,33 +285,18 @@ export async function deleteReport(id: number): Promise<void> {
   return apiFetch(`/api/admin/reports/${id}`, { method: "DELETE" });
 }
 
-// ─── AI Insights ─────────────────────────────────────────────────────────────
-
 export async function getAIInsights(): Promise<AIInsightsResponse> {
   return apiFetch("/api/admin/ai-insights", { method: "POST" });
 }
 
-// ─── CV Verification ─────────────────────────────────────────────────────────
-
-/**
- * Run computer-vision analysis on every photo of a location.
- * Returns predicted class + confidence scores for each photo.
- *
- * The backend proxies this to a Hugging Face Space running EfficientNet-B0.
- * Expect ~1-3 seconds for the typical location (4 photos in parallel).
- */
 export async function analyzeLocationPhotos(locationId: number): Promise<CVAnalysisResponse> {
   return apiFetch(`/api/admin/locations/${locationId}/analyze`, { method: "POST" });
 }
 
-// ─── Photo URL helper ─────────────────────────────────────────────────────────
-
 export function photoUrl(filename: string): string {
-  // Photos are now stored as full Supabase public URLs in the DB,
-  // so if `filename` already starts with http(s)://, return it as-is.
+  // supabase urls are stored verbatim; fall back to flask static for legacy filenames
   if (filename.startsWith("http://") || filename.startsWith("https://")) {
     return filename;
   }
-  // Legacy fallback: locally-served upload via the Flask static route.
   return `${getBase()}/api/v1/uploads/${filename}`;
 }

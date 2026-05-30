@@ -28,7 +28,7 @@ export function LanguageProvider({ children }: { children: React.ReactNode }) {
   const [lang, setLang] = useState<Lang>("en");
 
   useEffect(() => {
-    // Pre-hydration script already set <html>; just mirror to state.
+    // pre-hydration script already set <html>; mirror it into state
     const isAr = document.documentElement.classList.contains("rtl");
     setLang(isAr ? "ar" : "en");
   }, []);

@@ -409,6 +409,63 @@ def api_me():
     }), 200
 
 
+@mobile_api.route('/auth/check-username', methods=['GET'])
+def api_check_username():
+    import re
+    from models import User
+
+    username = (request.args.get('username') or '').strip()
+    if not username:
+        return jsonify({'error': 'username query parameter is required'}), 400
+
+    if len(username) > 25 or not re.match(r'^[A-Za-z0-9_]+$', username):
+        return jsonify({'available': False, 'username': username}), 200
+
+    taken = User.query.filter_by(username=username).first() is not None
+    return jsonify({'available': not taken, 'username': username}), 200
+
+
+@mobile_api.route('/auth/change-username', methods=['PUT'])
+@jwt_required()
+def api_change_username():
+    import re
+    from models import User
+    from extensions import db
+
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({'error': 'Request body must be JSON'}), 400
+
+    new_username = (data.get('new_username') or '').strip()
+    if not new_username:
+        return jsonify({'error': 'new_username is required'}), 400
+
+    if len(new_username) > 25:
+        return jsonify({'error': 'Username must be 25 characters or fewer'}), 400
+
+    if not re.match(r'^[A-Za-z0-9_]+$', new_username):
+        return jsonify({'error': 'Username may only contain letters, digits, and underscores'}), 400
+
+    if new_username == user.username:
+        return jsonify({'username': user.username}), 200
+
+    if User.query.filter_by(username=new_username).first():
+        return jsonify({'error': 'Username already taken'}), 409
+
+    try:
+        user.username = new_username
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify({'error': 'Failed to update username'}), 500
+
+    return jsonify({'username': user.username}), 200
+
+
 @mobile_api.route('/locations', methods=['GET'])
 def api_get_locations():
     from models import Location, Review

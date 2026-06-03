@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /home/ninjaytxz/CodingProjects/JOAccessMobile/)",
+      "Read(//home/ninjaytxz/CodingProjects/JOAccessMobile/**)"
+    ],
+    "additionalDirectories": [
+      "/home/ninjaytxz/CodingProjects/JOAccessMobile/src/screens"
+    ]
+  }
+}

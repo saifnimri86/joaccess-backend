@@ -451,7 +451,7 @@ def api_change_username():
         return jsonify({'error': 'Username may only contain letters, digits, and underscores'}), 400
 
     if new_username == user.username:
-        return jsonify({'username': user.username}), 200
+        return jsonify({'error': 'New username must be different from your current username'}), 400
 
     if User.query.filter_by(username=new_username).first():
         return jsonify({'error': 'Username already taken'}), 409
@@ -464,6 +464,41 @@ def api_change_username():
         return jsonify({'error': 'Failed to update username'}), 500
 
     return jsonify({'username': user.username}), 200
+
+
+@mobile_api.route('/auth/change-password', methods=['PUT'])
+@jwt_required()
+def api_change_password():
+    from extensions import db
+
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({'error': 'Request body must be JSON'}), 400
+
+    current_password = data.get('current_password') or ''
+    new_password = data.get('new_password') or ''
+
+    if not current_password or not new_password:
+        return jsonify({'error': 'current_password and new_password are required'}), 400
+
+    if not bcrypt.check_password_hash(user.password, current_password):
+        return jsonify({'error': 'Current password is incorrect'}), 401
+
+    if len(new_password) < 6:
+        return jsonify({'error': 'New password must be at least 6 characters'}), 400
+
+    try:
+        user.password = bcrypt.generate_password_hash(new_password).decode('utf-8')
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify({'error': 'Failed to update password'}), 500
+
+    return jsonify({'success': True, 'message': 'Password updated successfully'}), 200
 
 
 @mobile_api.route('/locations', methods=['GET'])

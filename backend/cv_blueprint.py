@@ -117,7 +117,12 @@ def analyze_location_photos(location_id: int):
     if not location:
         return jsonify({"error": "Location not found"}), 404
 
-    photo_urls = [p.filename for p in location.photos]
+    photo_urls = []
+    for p in location.photos:
+        if p.filename.startswith("http://") or p.filename.startswith("https://"):
+            photo_urls.append(p.filename)
+        else:
+            photo_urls.append(f"{request.url_root}api/v1/uploads/{p.filename}")
     if not photo_urls:
         return jsonify({
             "location_id": location.id,
@@ -191,6 +196,10 @@ def cv_predict_single():
     if not data or not data.get("image_url"):
         return jsonify({"error": "image_url is required"}), 400
 
-    result = _classify_one_photo(data["image_url"], service_url, secret)
+    image_url = data["image_url"]
+    if not (image_url.startswith("http://") or image_url.startswith("https://")):
+        image_url = f"{request.url_root}api/v1/uploads/{image_url}"
+
+    result = _classify_one_photo(image_url, service_url, secret)
     status_code = 200 if result["success"] else 502
     return jsonify(result), status_code

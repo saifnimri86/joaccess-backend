@@ -1,6 +1,5 @@
 export const BACKENDS = {
   production: process.env.NEXT_PUBLIC_API_URL_PRODUCTION ?? "https://joaccess-backend.onrender.com",
-  staging:    process.env.NEXT_PUBLIC_API_URL_STAGING    ?? "https://joaccess-staging.onrender.com",
   local:      "http://localhost:5000",
 } as const;
 

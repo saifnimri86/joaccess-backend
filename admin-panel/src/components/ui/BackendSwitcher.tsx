@@ -17,9 +17,9 @@ export function BackendSwitcher() {
   }
 
   const isProd = env === "production";
-  const label = isProd ? "PROD" : "STAGING";
-  const next: BackendEnv = isProd ? "staging" : "production";
-  const dotColor = isProd ? "#6B8E4E" : "#D4A045";
+  const label = isProd ? "PROD" : "LOCAL";
+  const next: BackendEnv = isProd ? "local" : "production";
+  const dotColor = isProd ? "#6B8E4E" : "#3b82f6";
 
   function toggle() {
     setBackendEnv(next);

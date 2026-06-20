@@ -10,9 +10,10 @@ import {
 import { localizeCategory } from "@/lib/i18n";
 import { ConfirmModal } from "@/components/ui/ConfirmModal";
 import { PhotoCarouselModal } from "@/components/ui/PhotoCarouselModal";
+import { CVAnalysisModal } from "@/components/ui/CVAnalysisModal";
 import { Pagination } from "@/components/ui/Pagination";
 import { TableSkeleton } from "@/components/ui/Skeleton";
-import { MapPin, CheckCircle2, XCircle, Trash2, Search, Clock, Images } from "lucide-react";
+import { MapPin, CheckCircle2, XCircle, Trash2, Search, Clock, Images, Brain } from "lucide-react";
 import { useLanguage } from "@/contexts/LanguageContext";
 import { useTheme } from "@/contexts/ThemeContext";
 import { toast } from "@/lib/toast";
@@ -43,6 +44,7 @@ export default function LocationsPage() {
   const [verified, setVerified] = useState<"" | "true" | "false">("");
   const [toDelete, setToDelete] = useState<Location | null>(null);
   const [photoLoc, setPhotoLoc] = useState<Location | null>(null);
+  const [cvLoc, setCvLoc] = useState<Location | null>(null);
 
   // 350ms debounce so search doesn't fire per keystroke
   useEffect(() => {
@@ -263,6 +265,16 @@ export default function LocationsPage() {
                             <span className="font-mono text-[10px]">{loc.photos.length}</span>
                           </button>
                         )}
+                        <button
+                          onClick={() => setCvLoc(loc)}
+                          disabled={loc.photos.length === 0}
+                          className="btn-row row-success"
+                          title={loc.photos.length > 0 ? t("cv_analyze") : t("cv_no_photos")}
+                          aria-label={t("cv_analyze")}
+                        >
+                          <Brain size={13} />
+                          <span>{t("cv_analyze_short")}</span>
+                        </button>
                         {loc.is_verified ? (
                           <button onClick={() => unverifyMut.mutate(loc.id)} disabled={unverifyMut.isPending} className="btn-row row-warn">
                             <XCircle size={13} /> {t("loc_unverify")}
@@ -300,6 +312,14 @@ export default function LocationsPage() {
         photos={photoLoc?.photos ?? []}
         locationName={photoLoc?.name ?? ""}
         onClose={() => setPhotoLoc(null)}
+      />
+
+      <CVAnalysisModal
+        open={!!cvLoc}
+        locationId={cvLoc?.id ?? null}
+        locationName={cvLoc?.name ?? ""}
+        photos={cvLoc?.photos ?? []}
+        onClose={() => setCvLoc(null)}
       />
     </div>
   );

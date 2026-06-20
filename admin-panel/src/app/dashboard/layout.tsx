@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { getToken, getAdminMe, type AdminUser } from "@/lib/api";
+import { getToken, getAdminMe, clearToken, type AdminUser } from "@/lib/api";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { Loader2, Sun, Moon, Globe, Menu, X } from "lucide-react";
 import { useTheme } from "@/contexts/ThemeContext";
@@ -15,6 +15,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   const [checking, setChecking] = useState(true);
   const [user, setUser] = useState<AdminUser | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const { theme, toggleTheme } = useTheme();
   const { lang, toggleLang } = useLanguage();
 
@@ -24,13 +25,20 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       router.replace("/login");
       return;
     }
+    setError(null);
     getAdminMe()
       .then((u) => {
         setUser(u);
         setChecking(false);
       })
-      .catch(() => {
-        router.replace("/login");
+      .catch((err) => {
+        console.error("Dashboard profile fetch failed:", err);
+        if (!getToken()) {
+          router.replace("/login");
+        } else {
+          setError(err instanceof Error ? err.message : "Failed to connect to server");
+          setChecking(false);
+        }
       });
   }, [router]);
 
@@ -51,6 +59,62 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     return (
       <div className="min-h-screen flex items-center justify-center" style={{ background: "var(--c-bg)" }}>
         <Loader2 size={22} className="animate-spin" style={{ color: "var(--color-maroon-300)" }} />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center p-4 text-center" style={{ background: "var(--c-bg)" }}>
+        <div className="card max-w-md p-8 border border-red-500/20" style={{ boxShadow: "0 20px 60px var(--c-shadow)" }}>
+          <div className="w-12 h-12 rounded-full bg-red-100 dark:bg-red-950/30 flex items-center justify-center mx-auto mb-4 text-red-600 dark:text-red-400">
+            <X size={24} />
+          </div>
+          <h2 className="text-xl font-display font-bold mb-2" style={{ color: "var(--c-ink)" }}>
+            Connection Error
+          </h2>
+          <p className="text-sm mb-4" style={{ color: "var(--c-ink-muted)" }}>
+            {error.includes("Failed to fetch") || error.includes("HTTP 502") || error.includes("HTTP 504")
+              ? "Could not connect to the backend server. It may be offline or spinning up."
+              : `Server returned an error: ${error}`}
+          </p>
+          <p className="text-xs mb-6" style={{ color: "var(--c-ink-dim)" }}>
+            Note: The Render free tier backend automatically spins down after inactivity and can take up to 60 seconds to wake up.
+          </p>
+          <div className="flex gap-3 justify-center">
+            <button
+              onClick={() => {
+                setChecking(true);
+                setError(null);
+                getAdminMe()
+                  .then((u) => {
+                    setUser(u);
+                    setChecking(false);
+                  })
+                  .catch((err) => {
+                    if (!getToken()) {
+                      router.replace("/login");
+                    } else {
+                      setError(err instanceof Error ? err.message : "Failed to connect to server");
+                      setChecking(false);
+                    }
+                  });
+              }}
+              className="btn-maroon px-5 py-2 text-sm"
+            >
+              Retry Connection
+            </button>
+            <button
+              onClick={() => {
+                clearToken();
+                router.replace("/login");
+              }}
+              className="toggle-pill border border-gray-300 dark:border-zinc-700 px-5 py-2 text-sm"
+            >
+              Go to Login
+            </button>
+          </div>
+        </div>
       </div>
     );
   }

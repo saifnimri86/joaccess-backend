@@ -77,7 +77,8 @@ export function CVAnalysisModal({
   const currentResult: CVPhotoResult | null = useMemo(() => {
     if (!analysis || !photos[index]) return null;
     const targetUrl = photos[index];
-    return analysis.results.find((r) => r.photo_url === targetUrl) ?? null;
+    const resolvedTargetUrl = photoUrl(targetUrl);
+    return analysis.results.find((r) => r.photo_url === targetUrl || r.photo_url === resolvedTargetUrl) ?? null;
   }, [analysis, photos, index]);
 
   const sortedScores = useMemo(() => {

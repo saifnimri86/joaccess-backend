@@ -702,7 +702,51 @@ def api_update_location(location_id):
     if not data:
         return jsonify({'error': 'Request body required'}), 400
 
+    # Name-based duplicate check
+    if 'name' in data or 'name_ar' in data:
+        query_name = data.get('name', '').strip() if 'name' in data else location.name
+        query_name_ar = data.get('name_ar', '').strip() if 'name_ar' in data else location.name_ar
+
+        existing_by_name = Location.query.filter(
+            (Location.name.ilike(query_name) | Location.name_ar.ilike(query_name_ar)),
+            Location.user_id != user.id,
+            Location.id != location.id
+        ).first()
+        if existing_by_name:
+            return jsonify({
+                'error': f'A location with the name "{existing_by_name.name}" has already been added by another user.'
+            }), 409
+
+    # Proximity-based duplicate check
+    if 'latitude' in data or 'longitude' in data:
+        try:
+            query_lat = float(data['latitude']) if 'latitude' in data else location.latitude
+            query_lng = float(data['longitude']) if 'longitude' in data else location.longitude
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Invalid latitude or longitude'}), 400
+
+        lat_margin = 0.0002
+        lon_margin = 0.0002
+        nearby_locations = Location.query.filter(
+            Location.latitude.between(query_lat - lat_margin, query_lat + lat_margin),
+            Location.longitude.between(query_lng - lon_margin, query_lng + lon_margin),
+            Location.user_id != user.id,
+            Location.id != location.id
+        ).all()
+
+        for loc in nearby_locations:
+            dist = _haversine_km(query_lat, query_lng, loc.latitude, loc.longitude)
+            if dist <= 0.02:
+                return jsonify({
+                    'error': f'A location ("{loc.name}") has already been added by another user at this spot.'
+                }), 409
+
     try:
+        if not user.is_admin:
+            location.is_verified = False
+            location.verified_by = None
+            location.verified_at = None
+
         if 'name' in data:           location.name = data['name']
         if 'name_ar' in data:        location.name_ar = data['name_ar']
         if 'description' in data:    location.description = data['description']

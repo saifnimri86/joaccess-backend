@@ -601,6 +601,32 @@ def api_create_location():
     except (TypeError, ValueError):
         return jsonify({'error': 'Valid latitude and longitude are required'}), 400
 
+    # Check for name-based duplicates from other users
+    existing_by_name = Location.query.filter(
+        (Location.name.ilike(name) | Location.name_ar.ilike(name_ar)),
+        Location.user_id != user.id
+    ).first()
+    if existing_by_name:
+        return jsonify({
+            'error': f'A location with the name "{existing_by_name.name}" has already been added by another user.'
+        }), 409
+
+    # Check for proximity-based duplicates from other users (within 20 meters / 0.02 km)
+    lat_margin = 0.0002
+    lon_margin = 0.0002
+    nearby_locations = Location.query.filter(
+        Location.latitude.between(latitude - lat_margin, latitude + lat_margin),
+        Location.longitude.between(longitude - lon_margin, longitude + lon_margin),
+        Location.user_id != user.id
+    ).all()
+
+    for loc in nearby_locations:
+        dist = _haversine_km(latitude, longitude, loc.latitude, loc.longitude)
+        if dist <= 0.02:
+            return jsonify({
+                'error': f'A location ("{loc.name}") has already been added by another user at this spot.'
+            }), 409
+
     try:
         location = Location(
             name=name,

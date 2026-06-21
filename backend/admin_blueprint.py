@@ -333,6 +333,7 @@ def admin_get_users():
     per_page = min(50, max(1, int(request.args.get("per_page", 15))))
     search   = request.args.get("search", "").strip()
     user_type  = request.args.get("user_type", "").strip().lower()
+    role       = request.args.get("role", "").strip().lower()
     sort_by    = request.args.get("sort_by", "").strip().lower()
     sort_order = request.args.get("sort_order", "desc").strip().lower()
 
@@ -367,6 +368,11 @@ def admin_get_users():
 
     if user_type in ("individual", "organization"):
         stmt = stmt.where(User.user_type == user_type)
+
+    if role == "admin":
+        stmt = stmt.where(User.is_admin.is_(True))
+    elif role == "user":
+        stmt = stmt.where(User.is_admin.is_(False))
 
     if sort_by == "reviews":
         stmt = stmt.order_by(direction(review_count_sq), desc(User.created_at))

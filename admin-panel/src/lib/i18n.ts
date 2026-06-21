@@ -296,17 +296,21 @@ export function translate(
 
 // backend sends raw english; ar uses these maps, en falls back to a capitalized form
 const CATEGORY_AR: Record<string, string> = {
-  restaurant: "مطعم",
-  government:  "حكومي",
-  park:        "حديقة",
-  shopping:    "تسوق",
-  healthcare:  "رعاية صحية",
-  education:   "تعليم",
-  hotels:      "فنادق",
-  mosque:      "مسجد",
-  library:     "مكتبة",
-  gym:         "صالة رياضية",
-  pharmacy:    "صيدلية",
+  "Parks": "حدائق",
+  "Hotels": "فنادق",
+  "Healthcare": "رعاية صحية",
+  "Religious Places": "أماكن دينية",
+  "Entertainment": "ترفيه",
+  "Tourist Attractions": "مناطق سياحية",
+  "Supermarkets": "سوبرماركت",
+  "Educational": "تعليمية",
+  "Transportation": "مواصلات",
+  "Beauty & Wellness": "تجميل وصحة",
+  "Government Buildings": "مباني حكومية",
+  "Restaurants & Cafes": "مطاعم ومقاهي",
+  "Sports & Fitness": "رياضة ولياقة بدنية",
+  "Shopping Malls": "مراكز تسوق",
+  "Banks & ATMs": "بنوك وأجهزة صراف آلي",
 };
 
 const USER_TYPE_AR: Record<string, string> = {

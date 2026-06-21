@@ -25,8 +25,21 @@ const LocationsMap = dynamic(
 );
 
 const CATEGORIES = [
-  "restaurant","government","park","shopping","healthcare",
-  "education","hotels","mosque","library","gym","pharmacy",
+  "Parks",
+  "Hotels",
+  "Healthcare",
+  "Religious Places",
+  "Entertainment",
+  "Tourist Attractions",
+  "Supermarkets",
+  "Educational",
+  "Transportation",
+  "Beauty & Wellness",
+  "Government Buildings",
+  "Restaurants & Cafes",
+  "Sports & Fitness",
+  "Shopping Malls",
+  "Banks & ATMs",
 ];
 
 const ALL_LOCS_KEY = ["admin-locations-all"] as const;

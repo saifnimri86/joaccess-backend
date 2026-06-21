@@ -24,7 +24,7 @@ VALID_FEATURES = [
 ]
 
 MAX_PHOTO_BYTES = 5 * 1024 * 1024
-MAX_PHOTOS_PER_LOCATION = 10
+MAX_PHOTOS_PER_LOCATION = 5
 
 
 def _current_user_id():
@@ -141,7 +141,108 @@ def _serialize_location(loc, include_reviews=True):
     return result
 
 
+def _upload_to_supabase(img_bytes: bytes, filename: str) -> str | None:
+    """
+    Upload raw image bytes to Supabase Storage and return the public URL.
+    Returns None if the upload fails for any reason (caller skips that photo).
+
+    How it works:
+        - We call Supabase's REST Storage API directly with an HTTP PUT request,
+          no SDK needed — just `requests`.
+        - The path inside the bucket is just the filename (flat structure, no folders).
+        - The service role key bypasses RLS so the server can always write,
+          regardless of the bucket's read policies.
+        - On success Supabase returns 200/201 and the public URL is deterministic:
+          <SUPABASE_URL>/storage/v1/object/public/location-photos/<filename>
+        - We store that full public URL directly in Photo.filename, so every
+          consumer (mobile app, admin panel, CV blueprint) just uses it as-is.
+    """
+    import requests as http_requests
+
+    supabase_url = current_app.config.get('SUPABASE_URL', '').rstrip('/')
+    service_key = current_app.config.get('SUPABASE_SERVICE_KEY', '')
+
+    if not supabase_url or not service_key:
+        current_app.logger.error('Supabase Storage not configured — missing env vars.')
+        return None
+
+    bucket = 'location-photos'
+    upload_url = f'{supabase_url}/storage/v1/object/{bucket}/{filename}'
+
+    headers = {
+        'Authorization': f'Bearer {service_key}',
+        'Content-Type': 'image/jpeg',  # Supabase still accepts/serves PNG fine under this
+        'x-upsert': 'true',            # overwrite if the same filename already exists
+    }
+
+    try:
+        resp = http_requests.put(upload_url, data=img_bytes, headers=headers, timeout=30)
+        if resp.status_code in (200, 201):
+            return f'{supabase_url}/storage/v1/object/public/{bucket}/{filename}'
+        current_app.logger.error(
+            'Supabase Storage upload failed: %s %s', resp.status_code, resp.text[:300]
+        )
+        return None
+    except http_requests.RequestException as e:
+        current_app.logger.error('Supabase Storage request error: %s', e)
+        return None
+
+
+def _delete_from_supabase(filename: str) -> bool:
+    """
+    Delete a single object from Supabase Storage by filename.
+    Returns True on success, False on any failure (caller treats this as
+    best-effort cleanup, not correctness — same philosophy as the old
+    local-disk _remove_photos).
+    """
+    import requests as http_requests
+
+    supabase_url = current_app.config.get('SUPABASE_URL', '').rstrip('/')
+    service_key = current_app.config.get('SUPABASE_SERVICE_KEY', '')
+    if not supabase_url or not service_key:
+        return False
+
+    bucket = 'location-photos'
+    delete_url = f'{supabase_url}/storage/v1/object/{bucket}/{filename}'
+    headers = {'Authorization': f'Bearer {service_key}'}
+
+    try:
+        resp = http_requests.delete(delete_url, headers=headers, timeout=15)
+        if resp.status_code in (200, 204):
+            return True
+        current_app.logger.warning(
+            'Supabase Storage delete failed for %s: %s %s',
+            filename, resp.status_code, resp.text[:200]
+        )
+        return False
+    except http_requests.RequestException as e:
+        current_app.logger.warning('Supabase Storage delete request error for %s: %s', filename, e)
+        return False
+
+
+def _supabase_filename_from_value(value: str) -> str:
+    """
+    Photo.filename stores the full public Supabase URL. To delete an object
+    we need just the filename portion (the last path segment), since the
+    Storage delete endpoint takes <bucket>/<filename>, not the full URL.
+    Falls back to returning the value unchanged if it isn't a URL — this
+    keeps old pre-migration rows (bare filenames, if any remain) from
+    crashing the delete call; they'll just no-op against Supabase, which
+    is fine since they were never there to begin with.
+    """
+    if not value:
+        return value
+    return value.rsplit('/', 1)[-1]
+
+
 def _save_base64_photos(photos_raw, location_id):
+    """
+    Decode base64 photos from the request payload and upload them to
+    Supabase Storage. Stores the returned public URL in the Photo row.
+
+    Accepts either a list of dicts or a JSON string (multipart sends it
+    as a string field). Each dict must have 'data' (base64) and 'filename'.
+    """
     from models import Photo
     from extensions import db
 
@@ -168,23 +269,18 @@ def _save_base64_photos(photos_raw, location_id):
             continue
 
         filename = _generate_unique_filename(photo_data['filename'])
-        upload_folder = current_app.config['UPLOAD_FOLDER']
-        os.makedirs(upload_folder, exist_ok=True)
-        filepath = os.path.join(upload_folder, filename)
+        public_url = _upload_to_supabase(img_bytes, filename)
+        if not public_url:
+            continue  # upload failed — skip this photo, don't create an orphan DB row
 
-        try:
-            with open(filepath, 'wb') as f:
-                f.write(img_bytes)
-        except OSError:
-            continue
-
-        db.session.add(Photo(location_id=location_id, filename=filename))
+        db.session.add(Photo(location_id=location_id, filename=public_url))
         saved += 1
 
     return saved
 
+
 def _remove_photos(removed_raw, location_id):
-    # db is authoritative — orphan files on unlink failure are cleanup, not correctness
+    # db is authoritative — orphan objects on Supabase delete failure are cleanup, not correctness
     from models import Photo
     from extensions import db
     if isinstance(removed_raw, str):
@@ -204,20 +300,20 @@ def _remove_photos(removed_raw, location_id):
     for row in rows:
         db.session.delete(row)
     db.session.flush()
-    upload_folder = current_app.config['UPLOAD_FOLDER']
-    for filename in confirmed:
-        filepath = os.path.join(upload_folder, filename)
-        try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        except OSError as e:
+    for stored_value in confirmed:
+        object_name = _supabase_filename_from_value(stored_value)
+        if not _delete_from_supabase(object_name):
             current_app.logger.warning(
-                'Failed to delete photo file %s: %s', filename, e
+                'Failed to delete Supabase Storage object for %s', stored_value
             )
     return len(confirmed)
 
 
 def _save_multipart_photos(files_list, location_id):
+    """
+    Read photo files from a multipart/form-data request and upload them
+    to Supabase Storage. Stores the returned public URL in the Photo row.
+    """
     from models import Photo
     from extensions import db
 
@@ -234,17 +330,13 @@ def _save_multipart_photos(files_list, location_id):
         if size > MAX_PHOTO_BYTES:
             continue
 
+        img_bytes = file.read()
         filename = _generate_unique_filename(file.filename)
-        upload_folder = current_app.config['UPLOAD_FOLDER']
-        os.makedirs(upload_folder, exist_ok=True)
-        filepath = os.path.join(upload_folder, filename)
-
-        try:
-            file.save(filepath)
-        except OSError:
+        public_url = _upload_to_supabase(img_bytes, filename)
+        if not public_url:
             continue
 
-        db.session.add(Photo(location_id=location_id, filename=filename))
+        db.session.add(Photo(location_id=location_id, filename=public_url))
         saved += 1
 
     return saved
@@ -809,7 +901,7 @@ def api_update_location(location_id):
 @mobile_api.route('/locations/<int:location_id>', methods=['DELETE'])
 @jwt_required()
 def api_delete_location(location_id):
-    # delete db row first — orphan files are cleanup, not correctness
+    # delete db row first — Supabase Storage cleanup afterward is best-effort, not correctness
     from models import Location
     from extensions import db
 
@@ -834,15 +926,12 @@ def api_delete_location(location_id):
         db.session.rollback()
         return jsonify({'error': 'Failed to delete location'}), 500
 
-    upload_folder = current_app.config['UPLOAD_FOLDER']
-    for filename in photo_files:
-        filepath = os.path.join(upload_folder, filename)
-        try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        except OSError as e:
+    # db row is gone — Supabase Storage cleanup is best-effort, not correctness
+    for stored_value in photo_files:
+        object_name = _supabase_filename_from_value(stored_value)
+        if not _delete_from_supabase(object_name):
             current_app.logger.warning(
-                'Failed to delete photo file %s: %s', filename, e
+                'Failed to delete Supabase Storage object for %s', stored_value
             )
 
     return jsonify({'success': True, 'message': 'Location deleted successfully'}), 200
@@ -1438,6 +1527,12 @@ def api_my_locations():
 
 @mobile_api.route('/uploads/<path:filename>', methods=['GET'])
 def api_serve_upload(filename):
+    """
+    Legacy fallback only. New photos are stored as full Supabase Storage
+    URLs and served directly from Supabase — this route is never hit for
+    them. It exists in case any old rows still have a bare local filename
+    in Photo.filename from before the Supabase migration.
+    """
     from flask import send_from_directory
 
     # prevent path traversal
